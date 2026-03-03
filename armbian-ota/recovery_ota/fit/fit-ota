@@ -1,0 +1,347 @@
+#!/bin/sh
+#
+# initramfs-tools init-premount hook:FIT OTA update
+
+PREREQ=""
+
+prereqs() {
+    echo "$PREREQ"
+}
+
+case "$1" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+# ===== logging: file + /dev/kmsg =====
+LOGDIR=/run/initramfs
+LOGFILE=${LOGDIR}/fit-ota.log
+mkdir -p "$LOGDIR"
+
+# increase printk level so /dev/kmsg goes to console
+echo "8 4 1 7" > /proc/sys/kernel/printk 2>/dev/null || true
+
+log() {
+    echo "FIT_OTA $*" >> "$LOGFILE" 2>/dev/null || true
+    echo "FIT_OTA $*" > /dev/kmsg 2>/dev/null || true
+}
+
+# ===== heartbeat for long-running operations =====
+HEARTBEAT_PID=""
+
+start_heartbeat() {
+    msg="$1"
+    (
+        while :; do
+            echo "FIT_OTA [HB] $msg" >> "$LOGFILE" 2>/dev/null || true
+            echo "FIT_OTA [HB] $msg" > /dev/kmsg 2>/dev/null || true
+            sleep 10
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+
+stop_heartbeat() {
+    if [ -n "$HEARTBEAT_PID" ]; then
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        HEARTBEAT_PID=""
+    fi
+}
+
+
+[ -f /scripts/functions ] && . /scripts/functions
+
+# default fallback devices (if detection fails)
+ROOT_DEV=""
+ROOT_MNT="/mnt/root"
+
+OTA_DIR="${ROOT_MNT}/ota_work"
+ROOTFS_TAR="${OTA_DIR}/rootfs.tar.gz"
+
+log "init-premount fit-ota hook start"
+log "LOGFILE=${LOGFILE}"
+
+touch "${LOGDIR}/fit_ota_ran.init-premount"
+
+# ===== helper: get security partition device =====
+get_security_partition() {
+    local security_part=""
+
+    # Try to find by by-name link first
+    if [ -e "/dev/block/by-name/security" ]; then
+        security_part="/dev/block/by-name/security"
+    else
+        # Fallback: search partitions by PARTNAME
+        for entry in /sys/block/mmcblk*/mmcblk*p*; do
+            if [ -f "$entry/uevent" ]; then
+                local name=$(grep PARTNAME "$entry/uevent" | cut -d= -f2)
+                if [ "$name" = "security" ]; then
+                    security_part="/dev/$(basename "$entry")"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    echo "$security_part"
+}
+
+# ===== helper: check if OTA should be triggered =====
+check_ota_trigger() {
+    local security_part=""
+    local last_byte=""
+
+    security_part=$(get_security_partition)
+
+    if [ -z "$security_part" ]; then
+        log "Security partition not found, skipping OTA update"
+        return 1
+    fi
+
+    log "Found security partition at $security_part"
+
+    # Read the last byte from the security partition
+    # Using dd to read just the last 512 bytes and tail to get the last byte
+    last_byte=$(dd if="$security_part" bs=512 skip=$(($(blockdev --getsz "$security_part") - 1)) count=1 2>/dev/null | tail -c 1 | od -tx1 -An | tr -d ' ')
+
+    if [ -z "$last_byte" ]; then
+        log "Failed to read security partition"
+        return 1
+    fi
+
+    log "Security partition last byte: 0x$last_byte"
+
+    # Check if last byte is aa (0xAA)
+    if [ "$last_byte" = "aa" ] || [ "$last_byte" = "AA" ]; then
+        log "Trigger condition met (0xAA), starting OTA update"
+        return 0
+    else
+        log "Trigger condition not met (last byte: 0x$last_byte), skipping OTA"
+        return 1
+    fi
+}
+
+# ===== helper: clear security partition trigger =====
+clear_security_trigger() {
+    local security_part=""
+    local sector_size=512
+    local last_sector=""
+    local temp_file=""
+
+    security_part=$(get_security_partition)
+
+    if [ -z "$security_part" ]; then
+        log "Security partition not found, cannot clear trigger"
+        return 1
+    fi
+
+    log "Clearing OTA trigger on security partition $security_part"
+
+    # Get the size of the partition in sectors
+    local total_sectors=$(blockdev --getsz "$security_part")
+    if [ -z "$total_sectors" ]; then
+        log "Failed to get partition size"
+        return 1
+    fi
+
+    # Calculate the last sector
+    last_sector=$((total_sectors - 1))
+
+    # Create a temporary file with the modified last sector
+    temp_file=$(mktemp)
+    if [ -z "$temp_file" ]; then
+        log "Failed to create temporary file"
+        return 1
+    fi
+
+    # Read the last sector, modify the last byte to 0x00, and write back
+    if ! dd if="$security_part" bs="$sector_size" skip="$last_sector" count=1 of="$temp_file" 2>/dev/null; then
+        log "Failed to read last sector from security partition"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    # Modify the last byte to 0x00
+    printf '\x00' | dd of="$temp_file" bs=1 seek=511 count=1 conv=notrunc 2>/dev/null
+
+    # Write the modified sector back
+    if ! dd if="$temp_file" of="$security_part" bs="$sector_size" seek="$last_sector" count=1 conv=notrunc 2>/dev/null; then
+        log "Failed to write modified sector to security partition"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    # Clean up
+    rm -f "$temp_file"
+
+    # Verify the change
+    local new_last_byte=$(dd if="$security_part" bs=512 skip=$last_sector count=1 2>/dev/null | tail -c 1 | od -tx1 -An | tr -d ' ')
+    log "Security partition last byte after clear: 0x${new_last_byte:-<empty>}"
+
+    if [ "$new_last_byte" = "00" ]; then
+        log "Successfully cleared OTA trigger"
+        return 0
+    else
+        log "Failed to clear OTA trigger (last byte: 0x${new_last_byte:-<empty>})"
+        return 1
+    fi
+}
+
+# ===== helper: get LUKS UUID for encrypted root backing device =====
+get_luks_uuid_for_root() {
+    blkid -t TYPE=crypto_LUKS -s UUID -o value 2>/dev/null | head -n1
+}
+
+# ===== check OTA trigger =====
+if ! check_ota_trigger; then
+    log "No OTA update required"
+    exit 0
+fi
+
+# ===== set root device =====
+ROOT_DEV="/dev/mapper/armbian-root"
+log "Using encrypted root device: ${ROOT_DEV}"
+
+log "ROOT_DEV=${ROOT_DEV}"
+
+# ===== wait for encrypted root device to appear =====
+log "Waiting for ${ROOT_DEV} to appear..."
+timeout=30
+elapsed=0
+while [ ! -e "${ROOT_DEV}" ]; do
+    if [ $elapsed -ge $timeout ]; then
+        log "Timeout waiting for ${ROOT_DEV}, aborting OTA"
+        exit 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+    log "Still waiting for ${ROOT_DEV}... (${elapsed}s)"
+done
+log "${ROOT_DEV} is now available"
+
+# ===== 1) mount rootfs to /mnt/root =====
+mkdir -p "${ROOT_MNT}"
+log "mounting ${ROOT_DEV} -> ${ROOT_MNT} ..."
+if ! mount -t ext4 -o rw "${ROOT_DEV}" "${ROOT_MNT}"; then
+    log "cannot mount ${ROOT_DEV}, skip OTA"
+    # Clear trigger on mount failure
+    log "Clearing security trigger due to mount failure"
+    clear_security_trigger || log "WARNING: Failed to clear security trigger"
+    exit 0
+fi
+
+# check OTA payload: rootfs.tar.gz is required
+if [ ! -d "${OTA_DIR}" ] || [ ! -f "${ROOTFS_TAR}" ]; then
+    log "no rootfs OTA payload at ${OTA_DIR}, unmount and skip"
+    umount "${ROOT_MNT}" 2>/dev/null || true
+    # Clear trigger even if no payload found
+    log "Clearing security trigger due to missing payload"
+    clear_security_trigger || log "WARNING: Failed to clear security trigger"
+    exit 0
+fi
+
+log "found rootfs OTA payload, proceeding with rootfs OTA"
+
+# ===== 2) clean rootfs (except ota_work) =====
+log "cleaning ${ROOT_MNT} (except ota_work)..."
+start_heartbeat "cleaning rootfs at ${ROOT_MNT}"
+(
+    cd "${ROOT_MNT}" || exit 1
+    for f in * .[!.]* ..?*; do
+        case "$f" in
+            "."|".."|"ota_work")
+                continue
+                ;;
+        esac
+        rm -rf "$f"
+    done
+) || {
+    stop_heartbeat
+    log "ERROR: failed to clean ${ROOT_MNT}, abort OTA"
+    umount "${ROOT_MNT}" 2>/dev/null || true
+    # Clear trigger on clean failure
+    log "Clearing security trigger due to clean failure"
+    clear_security_trigger || log "WARNING: Failed to clear security trigger"
+    exit 0
+}
+stop_heartbeat
+
+# ===== 3) extract rootfs.tar.gz =====
+log "extracting ${ROOTFS_TAR} -> ${ROOT_MNT} ..."
+start_heartbeat "extracting rootfs.tar.gz to ${ROOT_MNT}"
+if ! tar  -xzf "${ROOTFS_TAR}" -C "${ROOT_MNT}"; then
+    stop_heartbeat
+    log "ERROR: extract rootfs.tar.gz failed, abort OTA"
+    umount "${ROOT_MNT}" 2>/dev/null || true
+    # Clear trigger on extract failure
+    log "Clearing security trigger due to extract failure"
+    clear_security_trigger || log "WARNING: Failed to clear security trigger"
+    exit 0
+fi
+stop_heartbeat
+
+sync
+
+# ===== 4) fix UUIDs in new rootfs /etc/fstab + /etc/crypttab =====
+FSTAB="${ROOT_MNT}/etc/fstab"
+CRYPTTAB="${ROOT_MNT}/etc/crypttab"
+
+# 4.1 patch new rootfs /etc/fstab
+if [ -f "${FSTAB}" ]; then
+    log "patching ${FSTAB} ..."
+    # For encrypted root, ensure /dev/mapper/armbian-root is used
+    log "  - update / entry to use /dev/mapper/armbian-root"
+    sed -i -E 's|^UUID=[^[:space:]]+[[:space:]]+/[[:space:]]+|/dev/mapper/armbian-root / |' "${FSTAB}"
+else
+    log "WARN: ${FSTAB} not found, skip fstab UUID patch"
+fi
+
+# 4.2 patch new rootfs /etc/crypttab (update LUKS UUID)
+if [ -f "${CRYPTTAB}" ]; then
+    luks_uuid=$(get_luks_uuid_for_root)
+    if [ -n "$luks_uuid" ]; then
+        log "patching ${CRYPTTAB} ..."
+        log "  - set armbian-root source UUID=${luks_uuid} (crypto_LUKS)"
+        # Replace the UUID=... in the armbian-root line; keep other columns intact
+        sed -i -E "s|^(armbian-root[[:space:]]+)UUID=[0-9a-fA-F-]+|\1UUID=${luks_uuid}|" "${CRYPTTAB}"
+    else
+        log "WARN: cannot determine LUKS UUID; skip crypttab patch"
+    fi
+else
+    log "WARN: ${CRYPTTAB} not found, skip crypttab UUID patch"
+fi
+
+sync
+
+log "delete OTA payload directory ${OTA_DIR} ..."
+rm -rf ${OTA_DIR} || true
+
+# ===== 5) unmount partition =====
+log "unmounting ${ROOT_MNT} ..."
+umount "${ROOT_MNT}" 2>/dev/null || log "WARN: umount ${ROOT_MNT} failed"
+
+sync
+
+# ===== 6) clear OTA trigger on security partition =====
+log "OTA completed successfully, clearing security trigger"
+if ! clear_security_trigger; then
+    log "WARNING: Failed to clear security trigger, but OTA was completed"
+fi
+
+# ===== 7) reboot =====
+log "OTA done, rebooting..."
+
+if [ -w /proc/sysrq-trigger ]; then
+    echo b > /proc/sysrq-trigger
+fi
+
+if command -v reboot >/dev/null 2>&1; then
+    reboot -f
+fi
+
+while :; do
+    log "reboot failed, please power cycle"
+    sleep 10
+done

@@ -1,0 +1,11 @@
+[Unit]
+Description=Resize userdata partition to fill disk
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/armbian/armbian-resize-userdata
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

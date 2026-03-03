@@ -1,0 +1,51 @@
+#!/bin/sh
+
+# initramfs-tools hook: add tools (rm, tar, gzip) into initramfs
+
+set -e
+
+
+. /usr/share/initramfs-tools/hook-functions
+
+echo "[99-copy-tools] adding /usr/bin/rm, /usr/bin/tar, /usr/bin/gzip... into initramfs..." >&2
+
+# ===== rm =====
+if [ -x /usr/bin/rm ]; then
+    copy_exec /usr/bin/rm /usr/bin
+fi
+
+# ===== tar =====
+if [ -x /usr/bin/tar ]; then
+    copy_exec /usr/bin/tar /usr/bin
+fi
+
+# ===== gzip / gunzip =====
+if [ -x /usr/bin/gzip ]; then
+    copy_exec /usr/bin/gzip /usr/bin
+    copy_exec /usr/bin/gunzip /usr/bin
+fi
+
+# ===== sed =====
+if [ -x /usr/bin/sed ]; then
+    copy_exec /usr/bin/sed /usr/bin
+fi
+
+# ===== find =====
+if [ -x /usr/bin/find ]; then
+    copy_exec /usr/bin/find /usr/bin
+fi
+
+# ===== grep =====
+if [ -x /usr/bin/grep ]; then
+    copy_exec /usr/bin/grep /usr/bin
+fi
+
+# ===== sync =====
+if [ -x /usr/bin/sync ]; then
+    copy_exec /usr/bin/sync /usr/bin
+fi
+
+# ===== awk =====
+if [ -x /usr/bin/awk ]; then
+    copy_exec /usr/bin/awk /usr/bin
+fi

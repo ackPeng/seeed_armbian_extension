@@ -1,0 +1,596 @@
+#!/bin/bash
+#
+# armbian-ota-manager - AB partition OTA management tool
+#
+# Usage:
+#   armbian-ota-manager start <ota-package.tar.gz>
+#   armbian-ota-manager mark-success
+#   armbian-ota-manager rollback
+#   armbian-ota-manager status
+#
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/common.sh" ]; then
+    . "${SCRIPT_DIR}/lib/common.sh"
+elif [ -f /usr/share/armbian-ota/common.sh ]; then
+    . /usr/share/armbian-ota/common.sh
+else
+    echo "ERROR: Cannot find common.sh library"
+    exit 1
+fi
+
+# Configuration
+AB_OTA_ROOTFS_TAR="rootfs.tar.gz"
+AB_OTA_BOOT_TAR="boot.tar.gz"
+AB_OTA_ROOTFS_SHA="rootfs.sha256"
+AB_OTA_BOOT_SHA="boot.sha256"
+
+# ===== U-boot environment management =====
+uboot_get_env() {
+    fw_printenv -n "$1" 2>/dev/null || echo ""
+}
+
+uboot_set_env() {
+    local key="$1"
+    local value="$2"
+    log_info "Setting u-boot env: ${key}=${value}"
+    if ! fw_setenv "${key}" "${value}"; then
+        log_error "Failed to set u-boot env: ${key}=${value}"
+        return 1
+    fi
+    # Verify the value was set
+    local actual=$(fw_printenv -n "${key}" 2>/dev/null || echo "")
+    if [ "${actual}" != "${value}" ]; then
+        log_error "Verification failed: ${key}=${value}, but got: ${actual}"
+        return 1
+    fi
+    return 0
+}
+
+# ===== OTA initialization =====
+init_ota() {
+    init_logging
+    check_dependencies || error_exit "Missing dependencies"
+    acquire_lock || error_exit "Cannot acquire lock"
+}
+
+# ===== Update target partition directly =====
+update_target_partition() {
+    local temp_work="$1"
+    local target_root_label="$2"
+    local target_boot_label="$3"
+
+    # Determine target slot from labels
+    local target_slot=""
+    if [ "${target_root_label}" = "$ROOT_A_LABEL" ]; then
+        target_slot="a"
+    elif [ "${target_root_label}" = "$ROOT_B_LABEL" ]; then
+        target_slot="b"
+    fi
+
+    log_info "=== Updating target partition directly ==="
+
+    # Get target partition devices
+    local target_root_dev=$(get_part_by_label "${target_root_label}")
+    local target_boot_dev=$(get_part_by_label "${target_boot_label}")
+
+    if [ -z "${target_root_dev}" ]; then
+        error_exit "Cannot find target root partition (LABEL=${target_root_label})"
+    fi
+
+    log_info "Target root: ${target_root_dev}"
+    log_info "Target boot: ${target_boot_dev:-<none>}"
+
+    # Mount target root partition
+    local root_mnt=$(mktemp -d)
+    log_info "Mounting ${target_root_dev} to ${root_mnt}"
+
+    if ! mount -t ext4 -o rw "${target_root_dev}" "${root_mnt}"; then
+        rm -rf "${root_mnt}"
+        error_exit "Failed to mount target root partition"
+    fi
+
+    # Clean target rootfs (preserve some files if needed)
+    log_info "Cleaning target rootfs..."
+    (
+        cd "${root_mnt}" || exit 1
+        # Remove all files except we want to preserve
+        for f in * .[!.]* ..?*; do
+            case "$f" in
+                "."|".."|"lost+found")
+                    continue
+                    ;;
+            esac
+            rm -rf "$f" 2>/dev/null || true
+        done
+    )
+
+    # Extract rootfs
+    log_info "Extracting rootfs.tar.gz to target partition..."
+    if ! tar --xattrs --acls --numeric-owner -xzf "${temp_work}/${AB_OTA_ROOTFS_TAR}" -C "${root_mnt}"; then
+        umount "${root_mnt}" 2>/dev/null
+        rm -rf "${root_mnt}"
+        error_exit "Failed to extract rootfs.tar.gz"
+    fi
+
+    sync
+
+    # Handle boot partition if exists and we have boot.tar.gz
+    if [ -n "${target_boot_dev}" ] && [ -b "${target_boot_dev}" ] && [ -f "${temp_work}/${AB_OTA_BOOT_TAR}" ]; then
+        log_info "Updating boot partition..."
+
+        local boot_mnt=$(mktemp -d)
+        if mount -t ext4 -o rw "${target_boot_dev}" "${boot_mnt}"; then
+            # Clean boot partition (preserve some files if needed)
+            log_info "Cleaning target boot partition..."
+            (
+                cd "${boot_mnt}" || exit 1
+                # Remove all files except we want to preserve
+                for f in * .[!.]* ..?*; do
+                    case "$f" in
+                        "."|".."|"lost+found")
+                            continue
+                            ;;
+                    esac
+                    rm -rf "$f" 2>/dev/null || true
+                done
+            )
+
+            # Extract boot files
+            log_info "Extracting boot.tar.gz to target boot partition..."
+            if ! tar --xattrs --acls --numeric-owner -xzf "${temp_work}/${AB_OTA_BOOT_TAR}" -C "${boot_mnt}"; then
+                log_warn "Failed to extract boot.tar.gz, continuing anyway"
+            fi
+            sync
+            umount "${boot_mnt}" 2>/dev/null || true
+        else
+            log_warn "Failed to mount boot partition, skipping boot update"
+        fi
+        rm -rf "${boot_mnt}"
+    fi
+
+    # Get target partition UUIDs for configuration file updates
+    local target_root_uuid=$(get_uuid_by_label "${target_root_label}")
+    local target_boot_uuid=$(get_uuid_by_label "${target_boot_label}")
+
+    # Also get current (source) slot UUIDs for replacement
+    local current_slot=$(get_current_slot)
+    local current_root_label=$(get_slot_root_label "${current_slot}")
+    local current_boot_label=$(get_slot_boot_label "${current_slot}")
+    local current_root_uuid=$(get_uuid_by_label "${current_root_label}")
+    local current_boot_uuid=$(get_uuid_by_label "${current_boot_label}")
+
+    log_info "Current slot ${current_slot}: root_uuid=${current_root_uuid}, boot_uuid=${current_boot_uuid}"
+    log_info "Target slot ${target_slot}: root_uuid=${target_root_uuid}, boot_uuid=${target_boot_uuid}"
+
+    # Fix UUIDs in fstab and armbianEnv.txt
+    log_info "Fixing UUIDs in configuration files..."
+
+    # Fix /etc/fstab (handle both UUID and LABEL formats)
+    local fstab="${root_mnt}/etc/fstab"
+    if [ -f "${fstab}" ]; then
+        log_info "Patching ${fstab}..."
+
+        # Backup original fstab for debugging
+        cp "${fstab}" "${fstab}.ota-backup"
+
+        # First, try UUID-based replacement (preferred for systems using UUID)
+        # Read the existing UUIDs from fstab (not from current running system!)
+        local existing_root_uuid=$(grep -m1 'UUID=[0-9a-f-]*[[:space:]]*[[:space:]]*\/' "${fstab}" | sed -n 's/.*UUID=\([0-9a-f-]*\).*/\1/p')
+        local existing_boot_uuid=$(grep -m1 'UUID=[0-9a-f-]*[[:space:]]*[[:space:]]*\/boot' "${fstab}" | sed -n 's/.*UUID=\([0-9a-f-]*\).*/\1/p')
+
+        if [ -n "${existing_root_uuid}" ] && [ -n "${target_root_uuid}" ]; then
+            # Replace root filesystem UUID (handles both normal and overlayroot formats)
+            sed -i "s|UUID=${existing_root_uuid}|UUID=${target_root_uuid}|g" "${fstab}"
+            log_info "Updated root UUID: ${existing_root_uuid} -> ${target_root_uuid}"
+        fi
+
+        if [ -n "${existing_boot_uuid}" ] && [ -n "${target_boot_uuid}" ]; then
+            # Replace boot partition UUID
+            sed -i "s|UUID=${existing_boot_uuid}|UUID=${target_boot_uuid}|g" "${fstab}"
+            log_info "Updated boot UUID: ${existing_boot_uuid} -> ${target_boot_uuid}"
+        fi
+
+        # Also handle LABEL-based fallback (for systems using LABEL format)
+        # Update root partition LABEL
+        sed -i "s|LABEL=armbi_roota|LABEL=${target_root_label}|g" "${fstab}"
+        sed -i "s|LABEL=armbi_rootb|LABEL=${target_root_label}|g" "${fstab}"
+
+        # Update boot partition LABEL
+        sed -i "s|LABEL=armbi_boota|LABEL=${target_boot_label}|g" "${fstab}"
+        sed -i "s|LABEL=armbi_bootb|LABEL=${target_boot_label}|g" "${fstab}"
+
+        # Log the patched fstab for debugging
+        log_info "Patched fstab content:"
+        while IFS= read -r line; do
+            log_info "  ${line}"
+        done < "${fstab}"
+    fi
+
+    # Fix armbianEnv.txt - update rootdev to point to target root UUID
+    local arm_env=""
+    if [ -n "${target_boot_dev}" ] && [ -b "${target_boot_dev}" ]; then
+        # Remount boot to update armbianEnv.txt
+        local boot_mnt=$(mktemp -d)
+        if mount -t ext4 -o rw "${target_boot_dev}" "${boot_mnt}"; then
+            arm_env="${boot_mnt}/armbianEnv.txt"
+            if [ -f "${arm_env}" ]; then
+                log_info "Patching ${arm_env}..."
+                if [ -n "${target_root_uuid}" ]; then
+                    if grep -q '^rootdev=' "${arm_env}"; then
+                        sed -i "s|^rootdev=UUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+                        sed -i "s|^rootdev=PARTUUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+                        log_info "Updated rootdev=UUID=${target_root_uuid}"
+                    else
+                        printf '\nrootdev=UUID=%s\n' "${target_root_uuid}" >> "${arm_env}"
+                        log_info "Added rootdev=UUID=${target_root_uuid}"
+                    fi
+                else
+                    log_error "Failed to get target root UUID, cannot update armbianEnv.txt"
+                fi
+            fi
+            umount "${boot_mnt}" 2>/dev/null || true
+        fi
+        rm -rf "${boot_mnt}"
+    fi
+
+    # If no separate boot partition, check /boot on root
+    if [ -z "${arm_env}" ] && [ -f "${root_mnt}/boot/armbianEnv.txt" ]; then
+        arm_env="${root_mnt}/boot/armbianEnv.txt"
+        log_info "Patching ${arm_env}..."
+        if [ -n "${target_root_uuid}" ]; then
+            if grep -q '^rootdev=' "${arm_env}"; then
+                sed -i "s|^rootdev=UUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+                sed -i "s|^rootdev=PARTUUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+                log_info "Updated rootdev=UUID=${target_root_uuid}"
+            else
+                printf '\nrootdev=UUID=%s\n' "${target_root_uuid}" >> "${arm_env}"
+                log_info "Added rootdev=UUID=${target_root_uuid}"
+            fi
+        else
+            log_error "Failed to get target root UUID, cannot update armbianEnv.txt"
+        fi
+    fi
+
+    sync
+
+    # Unmount root
+    umount "${root_mnt}" 2>/dev/null || log_warn "Failed to unmount root"
+    rm -rf "${root_mnt}"
+
+    log_info "Target partition update completed!"
+}
+
+# ===== Start OTA process =====
+do_start_ota() {
+    local ota_package="$1"
+
+    # Initialize OTA (logging, lock, dependencies check)
+    init_ota
+
+    # Clear u-boot on SD/eMMC to ensure boot from SPI Flash
+    # This prevents SPL from loading u-boot from SD card instead of SPI Flash
+    log_info "Checking for SD/eMMC u-boot that needs to be cleared..."
+    local boot_part=$(get_part_by_label "${BOOT_A_LABEL}")
+    if [ -n "${boot_part}" ]; then
+        # Get the disk device (e.g., /dev/mmcblk1p1 -> /dev/mmcblk1)
+        local disk_dev=$(echo "$boot_part" | sed 's/p[0-9]*$//')
+        # Check if it's an mmc device (SD/eMMC)
+        if [[ "$disk_dev" == /dev/mmcblk* ]]; then
+            log_info "Found MMC device: ${disk_dev}, clearing u-boot to force SPI Flash boot"
+            # Clear u-boot region (offset 64 sectors, ~3.5MB)
+            if dd if=/dev/zero of="${disk_dev}" bs=512 seek=64 count=7104 conv=notrunc 2>/dev/null; then
+                log_info "Cleared u-boot bootloader area on ${disk_dev}"
+            else
+                log_warn "Failed to clear u-boot bootloader area on ${disk_dev}"
+            fi
+            # Clear u-boot environment region (offset 16384 sectors, ~8MB)
+            if dd if=/dev/zero of="${disk_dev}" bs=512 seek=16384 count=16351 conv=notrunc 2>/dev/null; then
+                log_info "Cleared u-boot environment area on ${disk_dev}"
+            else
+                log_warn "Failed to clear u-boot environment area on ${disk_dev}"
+            fi
+            sync
+        else
+            log_info "Boot device is ${disk_dev} (not MMC), skipping u-boot clear"
+        fi
+    fi
+
+    if [ -z "${ota_package}" ]; then
+        error_exit "Usage: $0 start <ota-package.tar.gz>"
+    fi
+
+    if [ ! -f "${ota_package}" ]; then
+        error_exit "OTA package not found: ${ota_package}"
+    fi
+
+    log_info "=== Starting AB partition OTA ==="
+    log_info "OTA package: ${ota_package}"
+
+    # Get current slot information
+    local current_slot=$(get_current_slot)
+    local target_slot=$(get_target_slot)
+
+    log_info "Current slot: ${current_slot}"
+    log_info "Target slot: ${target_slot}"
+
+    # Check if OTA is already in progress
+    if is_ota_in_progress; then
+        log_warn "OTA is already in progress"
+        local status=$(get_ota_status)
+        error_exit "Current status: ${status}"
+    fi
+
+    # Create temporary work directory
+    local temp_work=$(mktemp -d)
+    log_info "Extracting OTA package to ${temp_work}"
+
+    if ! tar -xzf "${ota_package}" -C "${temp_work}"; then
+        rm -rf "${temp_work}"
+        error_exit "Failed to extract OTA package"
+    fi
+
+    # Verify rootfs SHA256
+    if [ -f "${temp_work}/${AB_OTA_ROOTFS_SHA}" ]; then
+        if ! verify_sha256 "${temp_work}/${AB_OTA_ROOTFS_TAR}" "${temp_work}/${AB_OTA_ROOTFS_SHA}" "rootfs"; then
+            rm -rf "${temp_work}"
+            error_exit "Rootfs SHA256 verification failed"
+        fi
+    else
+        log_warn "No rootfs SHA256 file found, skipping verification"
+    fi
+
+    # Verify boot SHA256 (optional)
+    if [ -f "${temp_work}/${AB_OTA_BOOT_TAR}" ] && [ -f "${temp_work}/${AB_OTA_BOOT_SHA}" ]; then
+        if ! verify_sha256 "${temp_work}/${AB_OTA_BOOT_TAR}" "${temp_work}/${AB_OTA_BOOT_SHA}" "boot"; then
+            rm -rf "${temp_work}"
+            error_exit "Boot SHA256 verification failed"
+        fi
+    fi
+
+    # Get target partition labels
+    local target_root_label=$(get_slot_root_label "${target_slot}")
+    local target_boot_label=$(get_slot_boot_label "${target_slot}")
+
+    # Update target partition directly (system keeps running!)
+    update_target_partition "${temp_work}" "${target_root_label}" "${target_boot_label}"
+
+    # Clean up temp directory
+    rm -rf "${temp_work}"
+
+    # Update state
+    local current_version=$(get_current_version)
+    local target_version=$(extract_ota_version "${ota_package}")
+    local start_time=$(date -Iseconds)
+
+    write_state "active_slot" "${current_slot}"
+    write_state "target_slot" "${target_slot}"
+    write_state "status" "ready_to_boot"
+    write_state "try_count" "0"
+    write_state "current_version" "${current_version}"
+    write_state "target_version" "${target_version}"
+    write_state "start_time" "${start_time}"
+
+    # Set u-boot environment to boot from target slot on next reboot
+    log_info "Configuring u-boot environment for boot from slot ${target_slot}..."
+    if ! uboot_set_env "ota_in_progress" "1"; then
+        error_exit "Failed to set ota_in_progress flag"
+    fi
+    if ! uboot_set_env "boot_slot" "${target_slot}"; then
+        error_exit "Failed to set boot_slot to ${target_slot}"
+    fi
+    if ! uboot_set_env "try_count" "0"; then
+        log_warn "Failed to set try_count (non-critical)"
+    fi
+
+    log_info "=========================================="
+    log_info "OTA update completed successfully!"
+    log_info "Target slot: ${target_slot}"
+    log_info "=========================================="
+    log_info ""
+    log_info "The new firmware has been installed to slot ${target_slot}"
+    log_info "Your current system (slot ${current_slot}) is still running normally"
+    log_info ""
+    log_info "To switch to the new firmware, reboot:"
+    log_info "  reboot"
+    log_info ""
+    log_info "After reboot, health checks will run automatically"
+    log_info "If they fail, the system will automatically roll back to slot ${current_slot}"
+}
+
+# ===== Mark OTA as successful =====
+do_mark_success() {
+    init_logging
+    acquire_lock || error_exit "Cannot acquire lock"
+
+    log_info "=== Marking OTA as successful ==="
+
+    # Check if OTA is in progress
+    local ota_in_progress=$(uboot_get_env "ota_in_progress")
+    if [ "${ota_in_progress}" != "1" ]; then
+        log_info "No OTA in progress, nothing to mark"
+        exit 0
+    fi
+
+    # Get current slot
+    local current_slot=$(get_current_slot)
+    log_info "Current slot: ${current_slot}"
+
+    # Save successful slot
+    if ! uboot_set_env "boot_success" "${current_slot}"; then
+        log_error "Failed to set boot_success"
+    fi
+    if ! uboot_set_env "ota_in_progress" "0"; then
+        log_error "Failed to clear ota_in_progress"
+    fi
+    if ! uboot_set_env "try_count" "0"; then
+        log_warn "Failed to reset try_count"
+    fi
+
+    # Update state
+    local complete_time=$(date -Iseconds)
+    write_state "status" "success"
+    write_state "active_slot" "${current_slot}"
+    write_state "boot_success_slot" "${current_slot}"
+    write_state "complete_time" "${complete_time}"
+
+    log_info "OTA marked as successful"
+    log_info "System is now running from slot ${current_slot}"
+}
+
+# ===== Rollback OTA =====
+do_rollback() {
+    init_logging
+    acquire_lock || error_exit "Cannot acquire lock"
+
+    log_info "=== Rolling back OTA ==="
+
+    # Check if OTA is in progress
+    local ota_in_progress=$(uboot_get_env "ota_in_progress")
+    if [ "${ota_in_progress}" != "1" ]; then
+        log_info "No OTA in progress, nothing to rollback"
+        exit 0
+    fi
+
+    # Get last successful slot
+    local last_success=$(uboot_get_env "boot_success")
+    if [ -z "${last_success}" ]; then
+        last_success="a"
+        log_warn "No boot_success env found, defaulting to slot a"
+    fi
+
+    log_info "Rolling back to slot: ${last_success}"
+
+    # Increment try count in u-boot
+    local try_count=$(uboot_get_env "try_count")
+    try_count=${try_count:-0}
+    try_count=$((try_count + 1))
+
+    local max_tries=$(read_state "max_tries")
+    max_tries=${max_tries:-3}
+
+    if [ ${try_count} -ge ${max_tries} ]; then
+        log_error "Maximum retry count (${max_tries}) reached"
+        log_error "OTA rollback aborted, please check system manually"
+        write_state "status" "failed"
+        if ! uboot_set_env "ota_in_progress" "0"; then
+            log_error "Failed to clear ota_in_progress"
+        fi
+        exit 1
+    fi
+
+    # Set u-boot to boot from last successful slot
+    log_info "Setting u-boot boot_slot to ${last_success}..."
+    if ! uboot_set_env "boot_slot" "${last_success}"; then
+        log_error "Failed to set boot_slot for rollback"
+    fi
+    if ! uboot_set_env "ota_in_progress" "0"; then
+        log_error "Failed to clear ota_in_progress"
+    fi
+    if ! uboot_set_env "try_count" "${try_count}"; then
+        log_error "Failed to set try_count"
+    fi
+
+    # Update state
+    write_state "status" "rollback"
+    write_state "try_count" "${try_count}"
+
+    log_info "Rollback configured, rebooting in 5 seconds..."
+    sync
+    sleep 5
+    reboot
+}
+
+# ===== Show OTA status =====
+do_show_status() {
+    echo "=== Armbian AB OTA Status ==="
+    echo ""
+
+    # U-boot environment (source of truth for boot behavior)
+    echo "U-boot Environment:"
+    echo "  boot_slot: $(uboot_get_env 'boot_slot')"
+    echo "  boot_success: $(uboot_get_env 'boot_success')"
+    echo "  ota_in_progress: $(uboot_get_env 'ota_in_progress')"
+    echo "  try_count: $(uboot_get_env 'try_count')"
+    echo ""
+
+    # Slot information
+    local current_slot=$(get_current_slot)
+    local ota_in_progress=$(uboot_get_env 'ota_in_progress')
+
+    echo "Slot Information:"
+    echo "  Current slot: ${current_slot}"
+
+    # Only show target slot if OTA is in progress
+    if [ "${ota_in_progress}" = "1" ]; then
+        echo "  Target slot: $(get_target_slot)"
+    fi
+    echo ""
+
+    # State file (only show if OTA is in progress or recently completed)
+    if [ -f "${OTA_STATE_FILE}" ]; then
+        local status=$(read_state "status")
+        echo "OTA State:"
+        echo "  status: ${status}"
+        echo "  active_slot: $(read_state 'active_slot')"
+        if [ "${ota_in_progress}" = "1" ]; then
+            echo "  target_slot: $(read_state 'target_slot')"
+        fi
+        if [ "${status}" = "success" ] || [ "${status}" = "rollback" ]; then
+            echo "  complete_time: $(read_state 'complete_time')"
+        fi
+    else
+        echo "OTA State: No state file found"
+    fi
+    echo ""
+
+    # Partition status
+    echo "Partitions:"
+    for label in "$BOOT_A_LABEL" "$BOOT_B_LABEL" "$ROOT_A_LABEL" "$ROOT_B_LABEL"; do
+        local dev=$(get_part_by_label "${label}")
+        local uuid=$(get_uuid_by_label "${label}")
+        if [ -n "${dev}" ]; then
+            # Mark which partition is currently booted
+            local mark=""
+            local slot=""
+            if [ "${label}" = "$BOOT_A_LABEL" ] || [ "${label}" = "$ROOT_A_LABEL" ]; then
+                slot="a"
+            elif [ "${label}" = "$BOOT_B_LABEL" ] || [ "${label}" = "$ROOT_B_LABEL" ]; then
+                slot="b"
+            fi
+            if [ "${slot}" = "${current_slot}" ]; then
+                mark=" [BOOTING]"
+            fi
+            echo "  ${label}: ${dev} (UUID: ${uuid})${mark}"
+        else
+            echo "  ${label}: NOT FOUND"
+        fi
+    done
+}
+
+# ===== Main =====
+case "${1:-}" in
+    start)
+        do_start_ota "$2"
+        ;;
+    mark-success)
+        do_mark_success
+        ;;
+    rollback)
+        do_rollback
+        ;;
+    status)
+        do_show_status
+        ;;
+    *)
+        echo "Usage: $0 {start|mark-success|rollback|status}"
+        echo ""
+        echo "Commands:"
+        echo "  start <package>       Start OTA process with given package"
+        echo "  mark-success          Mark current OTA as successful"
+        echo "  rollback              Rollback to previous working version"
+        echo "  status                Show OTA status and information"
+        exit 1
+        ;;
+esac

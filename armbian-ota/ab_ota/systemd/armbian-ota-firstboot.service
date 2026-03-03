@@ -1,0 +1,23 @@
+[Unit]
+Description=Armbian AB OTA First Boot Health Check
+Documentation=https://docs.armbian.com
+DefaultDependencies=no
+After=network-online.target
+Wants=network-online.target
+Before=armbian-ota-mark-success.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/armbian/armbian-ota-health-check
+RemainAfterExit=yes
+TimeoutStartSec=300
+StandardOutput=journal+console
+StandardError=journal+console
+
+# Health check runs on every boot after OTA
+# The health-check script itself checks if OTA is in progress
+# If it passes, mark-success service will be triggered
+# If it fails, rollback service will be triggered
+
+[Install]
+WantedBy=multi-user.target

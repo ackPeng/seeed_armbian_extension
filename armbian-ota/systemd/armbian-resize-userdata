@@ -1,0 +1,171 @@
+#!/bin/bash
+
+do_expand_partition()
+{
+	local partdev=$1
+	echo -e "\n### [resize2fs] Trying to resize partition $partdev:\n"
+
+	# make sure the target is a partition
+	local parttype=$(lsblk -n -o TYPE $partdev | head -1)
+	if [[ "$parttype" != "part" ]]; then
+		echo -e "\n$partdev isn't a partition: $parttype" >&2
+		return 1
+	fi
+
+	local diskdevname=$(lsblk -n -o PKNAME $partdev | head -1) # i.e. mmcblk0 or sda
+	# due to the bug in util-linux 2.34 which fails to show device, let's use this failover:
+	[[ -z $diskdevname ]] && diskdevname=$(echo $partdev | sed -e "s/^\/dev\///" | sed "s/p.*//")
+	local diskdev="/dev/$diskdevname" # i.e. /dev/mmcblk0, /dev/sda
+	echo "diskdevname: $diskdevname"
+	echo "diskdev: $diskdev"
+
+	# detect partindex
+	local partindex="$(echo $partdev | sed "s|^$diskdev||" | sed 's/^p//')" # i.e. 1
+	if [[ -n "$(echo "$partindex" | tr -d '[:digit:]')" ]]; then
+		echo -e "\nFail to detect partindex: $partindex" >&2
+		return 1
+	fi
+	echo "partindex: $partindex"
+
+	# find the target part's boundaries
+	local partstart=$(parted $diskdev unit s print -sm | awk -F':' "NR>=3{if(\$1 == $partindex){print \$2}}" | sed 's/s//')
+	local partend=$(parted $diskdev unit s print -sm | awk -F':' "NR>=3{if(\$1 == $partindex){print \$3}}" | sed 's/s//')
+	if [[ -z "$partstart" ]] || [[ -z "$partend" ]]; then
+		echo -e "\nFail to find the target partition" >&2
+		return 1
+	fi
+	echo "partstart: ${partstart}s"
+	echo "partend: ${partend}s"
+
+	# check if it's the last partition in logical layout
+	# Note: the order may be different between partition table and logical layout
+	local list=$(parted $diskdev unit s print -sm | awk -F':' "NR>=3{if(\$2 - $partstart > 0){print \$1}}")
+	if [[ -n "$list" ]]; then
+		echo -e "\nThe target partition isn't the last partition in logical layout" >&2
+		echo "Partition ${list[*]} behind it" >&2
+		return 1
+	fi
+
+	local capacity=$(parted $diskdev unit s print -sm | awk -F':' 'NR==2{print $2}' | sed 's/s//')
+	local sectorsize=$(parted $diskdev unit s print -sm | awk -F':' 'NR==2{print $4}')
+	echo "capacity: ${capacity}s"
+	echo "sectorsize: ${sectorsize}B"
+
+	# For userdata, always resize to 100%
+	local lastsector=$(( $capacity - 1 ))
+	echo "Resizing to 100%: lastsector=${lastsector}s"
+
+	# use 16MiB to align partitions since this is the erase block size of more recent SD cards
+	local lastsector=$(( $lastsector - ($lastsector % (16 * 1024 * 1024 / $sectorsize)) - 1 ))
+
+	if [[ $lastsector -lt $partend ]]; then
+		echo -e "\n${partend} is larger than ${lastsector}s, that means you trying to shrink filesystem. Sorry, this tool designed for expanding only." >&2
+		return 1
+	elif [[ $lastsector -eq $partend ]]; then
+		echo -e "\nSame size. Skip" >&2
+		return 0
+	fi
+
+	echo -e "Old partition table:\n"
+	cat /proc/partitions
+
+	# Start resizing
+	echo -e "\nExecuting fdisk:"
+	local partnum=$(parted $diskdev unit s print -sm | awk 'END{print NR-2}')
+	local fdisk_version=$(fdisk --version | awk '{print $NF}' | grep -oE "^[[:digit:]]\.[[:digit:]]+")
+	if [[ $partnum == 1 ]] && awk "BEGIN{exit ! ($fdisk_version >= 2.27 )}"; then
+		# if dealing with fdisk from util-linux 2.27+ we need a workaround for just 1 partition
+		# though it does not break anything - just prevents an "unexpected command" to fdisk
+		# https://github.com/igorpecovnik/lib/issues/353#issuecomment-224728506
+		{
+			echo d
+			echo n; echo p; echo $partindex; echo $partstart; echo $lastsector
+			echo w
+		} | fdisk $diskdev
+	else
+		{
+			echo d; echo $partindex
+			echo n; echo p; echo $partindex; echo $partstart; echo $lastsector
+			echo w
+		} | fdisk $diskdev
+	fi
+
+	echo -e "\nExecuting partprobe:"
+	# Workaround for Kernel bug in 5.8.y and up. Ignore partprobe returning error and inticating that fs is not expended while it is
+	KERNELID=$(uname -r |  awk -F'.' '{print ($1 * 100) + $2}')
+	if ! partprobe $partdev && [[ ${KERNELID} -le 507 ]]; then
+		echo -e "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+		touch /var/run/resize2fs-reboot
+	fi
+
+	local partsize=$(lsblk -n -b -o SIZE $partdev | head -1)
+	local actualsize=$(( $sectorsize * ($lastsector - $partstart + 1) ))
+	if [[ $actualsize -ne $partsize ]]; then
+		echo -e "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+		touch /var/run/resize2fs-reboot
+	fi
+
+	echo -e "New partition table:\n"
+	cat /proc/partitions
+
+	return 0
+}
+
+do_expand_filesystem()
+{
+	local partdev=$1
+	local mountpoint=$2
+
+	local fstype=$(findmnt -n -o FSTYPE $mountpoint) # i.e. ext4 or btrfs
+
+	echo -e "\n### [resize2fs] Trying to resize $fstype filesystem on $partdev:\n"
+
+	case $fstype in
+		ext4)
+			echo "Running 'resize2fs $partdev' now..."
+			resize2fs $partdev
+			;;
+		xfs)
+			echo "Running 'xfs_growfs $mountpoint' now..."
+			xfs_growfs $mountpoint
+			;;
+		btrfs)
+			echo "Running 'btrfs filesystem resize max $mountpoint' now..."
+			btrfs filesystem resize max $mountpoint
+			;;
+		nilfs2)
+			echo "Running 'nilfs-resize -v -y $partdev' now..."
+			nilfs-resize -v -y $partdev
+			;;
+		*)
+			echo "Unsupported filesystem: $fstype"
+			echo "Trying to run 'resize2fs $partdev' now..."
+			resize2fs $partdev
+			return
+			;;
+	esac
+
+	# check whether reboot is necessary for resize2fs to take effect
+	local devsize=$(lsblk -n -b -o SIZE $partdev | head -1)
+	local fssize=$(findmnt -n -b -o SIZE --target $mountpoint)
+	if [[ $(( 100 * $fssize / $devsize )) -lt 90 ]]; then
+		echo -e "\n### [resize2fs] Automated reboot needed to finish the resize procedure"
+		touch /var/run/resize2fs-reboot
+	fi
+}
+
+# Resize userdata partition to fill disk
+
+userdata_dev=$(blkid -t PARTLABEL=userdata -o device 2>/dev/null | head -1)
+
+if [[ -n "$userdata_dev" ]]; then
+    echo "Resizing userdata partition: $userdata_dev"
+
+    do_expand_partition "$userdata_dev"
+    do_expand_filesystem "$userdata_dev" ""  # No mount point, assume ext4
+else
+    echo "Userdata partition not found"
+fi
+
+# Disable service
+systemctl disable armbian-resize-userdata.service

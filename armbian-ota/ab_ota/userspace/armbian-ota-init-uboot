@@ -1,0 +1,158 @@
+#!/bin/bash
+#
+# Initialize u-boot environment for AB partition OTA
+# This script modifies u-boot environment to support A/B slot boot selection
+# Supports NVMe, SD card (mmc), and eMMC (mmc) storage devices
+#
+
+set -e
+
+# Logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+log_info() {
+    log "INFO: $@"
+}
+
+log_error() {
+    log "ERROR: $@" >&2
+}
+
+# Check if already initialized
+if [ -f /var/lib/armbian-ota/uboot_initialized ]; then
+    log_info "u-boot AB environment already initialized"
+    exit 0
+fi
+
+# Check if fw_setenv/fw_printenv exists
+if ! command -v fw_printenv >/dev/null 2>&1 || ! command -v fw_setenv >/dev/null 2>&1; then
+    log_error "fw_printenv/fw_setenv not found"
+    exit 1
+fi
+
+log_info "=== Initializing u-boot AB partition boot environment ==="
+
+# ============================================================
+# Fixed partition numbers according to design
+# boot_a = partition 1, boot_b = partition 2, root_a = partition 3, root_b = partition 4
+# ============================================================
+BOOT_A_PART=1
+BOOT_B_PART=2
+ROOT_A_PART=3
+ROOT_B_PART=4
+
+log_info "Fixed partition layout:"
+log_info "  boot_a: partition ${BOOT_A_PART}"
+log_info "  boot_b: partition ${BOOT_B_PART}"
+log_info "  root_a: partition ${ROOT_A_PART}"
+log_info "  root_b: partition ${ROOT_B_PART}"
+
+# Get partition UUIDs
+boot_a_uuid=$(blkid -t LABEL="armbi_boota" -o value -s UUID 2>/dev/null | head -n1)
+boot_b_uuid=$(blkid -t LABEL="armbi_bootb" -o value -s UUID 2>/dev/null | head -n1)
+root_a_uuid=$(blkid -t LABEL="armbi_roota" -o value -s UUID 2>/dev/null | head -n1)
+root_b_uuid=$(blkid -t LABEL="armbi_rootb" -o value -s UUID 2>/dev/null | head -n1)
+
+log_info "Partition UUIDs:"
+log_info "  boot_a: ${boot_a_uuid:-<not found>}"
+log_info "  boot_b: ${boot_b_uuid:-<not found>}"
+log_info "  root_a: ${root_a_uuid:-<not found>}"
+log_info "  root_b: ${root_b_uuid:-<not found>}"
+
+# Save original bootcmd
+if ! fw_printenv -n orig_bootcmd >/dev/null 2>&1; then
+    orig_bootcmd=$(fw_printenv -n bootcmd 2>/dev/null || "")
+    if [ -n "$orig_bootcmd" ]; then
+        fw_setenv orig_bootcmd "${orig_bootcmd}"
+        log_info "Saved original bootcmd"
+    fi
+fi
+
+# Set default boot_slot if not exists
+if ! fw_printenv -n boot_slot >/dev/null 2>&1; then
+    fw_setenv boot_slot a
+    log_info "Set boot_slot to 'a'"
+fi
+
+# Set boot_success if not exists
+if ! fw_printenv -n boot_success >/dev/null 2>&1; then
+    fw_setenv boot_success a
+    log_info "Set boot_success to 'a'"
+fi
+
+# Set ota_in_progress if not exists
+if ! fw_printenv -n ota_in_progress >/dev/null 2>&1; then
+    fw_setenv ota_in_progress 0
+    log_info "Set ota_in_progress to '0'"
+fi
+
+# Set try_count if not exists
+if ! fw_printenv -n try_count >/dev/null 2>&1; then
+    fw_setenv try_count 0
+    log_info "Set try_count to '0'"
+fi
+
+# ============================================================
+# Set up distro_bootpart variables for each slot
+# ============================================================
+# Create a temporary file with all u-boot environment variables
+TEMP_ENV=$(mktemp)
+
+# Set partition numbers (fixed for all devices)
+echo "distro_bootpart_a ${BOOT_A_PART}" >> "${TEMP_ENV}"
+echo "distro_bootpart_b ${BOOT_B_PART}" >> "${TEMP_ENV}"
+
+log_info "Set distro_bootpart_a=${BOOT_A_PART}, distro_bootpart_b=${BOOT_B_PART}"
+
+# ============================================================
+# Modify bootcmd to use slot-based booting
+# ============================================================
+# The new bootcmd will:
+# 1. Initialize NVMe (PCIe enum) - needed before distro_bootcmd
+# 2. Set distro_bootpart based on boot_slot (using if/else to avoid nested variable expansion)
+# 3. Run distro_bootcmd which will scan devices in boot_targets order
+cat >> "${TEMP_ENV}" << 'EOF'
+# Initialize NVMe/PCIe, then set distro_bootpart based on boot_slot, then boot
+bootcmd run boot_pci_enum; if test "${boot_slot}" = "b"; then setenv distro_bootpart 2; else setenv distro_bootpart 1; fi; run distro_bootcmd; boot_fit; bootrkp
+EOF
+
+log_info "Modified bootcmd"
+
+# Apply all environment variables at once
+fw_setenv -s "${TEMP_ENV}"
+rm -f "${TEMP_ENV}"
+
+# ============================================================
+# Mark as initialized
+# ============================================================
+mkdir -p /var/lib/armbian-ota
+cat > /var/lib/armbian-ota/uboot_initialized << EOF
+# u-boot AB partition environment initialized
+$(date)
+boot_a_part=${BOOT_A_PART}
+boot_b_part=${BOOT_B_PART}
+root_a_part=${ROOT_A_PART}
+root_b_part=${ROOT_B_PART}
+boot_a_uuid=${boot_a_uuid}
+boot_b_uuid=${boot_b_uuid}
+root_a_uuid=${root_a_uuid}
+root_b_uuid=${root_b_uuid}
+EOF
+
+log_info "=== u-boot AB environment initialization complete ==="
+log_info "Please reboot for changes to take effect"
+log_info "Current boot_slot: $(fw_printenv -n boot_slot)"
+log_info "Current bootcmd: $(fw_printenv -n bootcmd)"
+
+# Disable and remove this service
+if [ -f /etc/systemd/system/armbian-ota-init-uboot.service ]; then
+    systemctl disable armbian-ota-init-uboot.service 2>/dev/null || true
+    rm -f /etc/systemd/system/armbian-ota-init-uboot.service
+fi
+
+# Remove this script itself
+rm -f "$0"
+
+exit 0

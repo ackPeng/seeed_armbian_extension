@@ -1,0 +1,30 @@
+#!/bin/sh
+
+# initramfs-tools hook: add tools (rm, tar, gzip) into initramfs
+
+set -e
+
+PREREQ=""
+
+prereqs() {
+    echo "$PREREQ"
+}
+
+case "$1" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+
+. /usr/share/initramfs-tools/hook-functions
+
+echo "[install-optee] adding optee client and ta into initramfs..." >&2
+
+copy_exec /usr/bin/keybox_app /usr/bin
+
+copy_exec /lib/optee_armtz/8c6cf810-685d-4654-ae71-8031beee467e.ta /lib/optee_armtz/
+
+copy_exec /usr/bin/tee-supplicant /usr/bin/
+copy_exec /usr/lib/libteec.so* /usr/lib/

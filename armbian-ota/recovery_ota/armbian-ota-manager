@@ -1,0 +1,579 @@
+#!/bin/bash
+#
+# armbian-ota-manager - Recovery OTA management tool
+#
+# Usage:
+#   armbian-ota-manager prepare <ota-package.tar.gz>
+#   armbian-ota-manager status
+#   armbian-ota-manager mark-success
+#   armbian-ota-manager rollback
+#
+
+set -e
+
+# Configuration
+OTA_WORK_DIR="/ota_work"
+ROOTFS_TAR="${OTA_WORK_DIR}/rootfs.tar.gz"
+ROOTFS_SHA="${OTA_WORK_DIR}/rootfs.sha256"
+BOOT_TAR="${OTA_WORK_DIR}/boot.tar.gz"
+BOOT_SHA="${OTA_WORK_DIR}/boot.sha256"
+BOOT_ITB="${OTA_WORK_DIR}/boot.itb"
+BOOT_ITB_SHA="${OTA_WORK_DIR}/boot.sha256"
+
+SECURITY_PART="/dev/block/by-name/security"
+
+# Detect mode: SECURE_BOOT or NORMAL
+SECURE_BOOT=0
+if [[ -f "/etc/armbian-release" ]]; then
+    source /etc/armbian-release 2>/dev/null || true
+fi
+
+# Check if we're in secure boot mode
+if [[ -n "$RK_SECURE_BOOT" ]] && [[ "$RK_SECURE_BOOT" == "yes" ]]; then
+    SECURE_BOOT=1
+fi
+
+# ===== Logging functions =====
+log() {
+    local level="$1"
+    shift
+    local message="*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] [${level}] ${message}"
+}
+
+log_info() {
+    log "INFO" "$@"
+}
+
+log_warn() {
+    log "WARN" "$@"
+}
+
+log_error() {
+    log "ERROR" "$@"
+}
+
+# ===== SHA256 verification =====
+verify_sha256() {
+    local payload="$1"
+    local sha_file="$2"
+    local label="${3:-payload}"
+
+    if [ ! -f "${payload}" ]; then
+        log_error "Missing ${label}: ${payload}"
+        return 1
+    fi
+
+    if [ ! -f "${sha_file}" ]; then
+        log_warn "Missing checksum file: ${sha_file}"
+        return 1
+    fi
+
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log_error "sha256sum not found"
+        return 1
+    fi
+
+    local payload_dir payload_base sha_dir sha_base
+    payload_dir="$(cd "$(dirname "${payload}")" && pwd)"
+    payload_base="$(basename "${payload}")"
+    sha_dir="$(cd "$(dirname "${sha_file}")" && pwd)"
+    sha_base="$(basename "${sha_file}")"
+
+    # Create temp checksum file with correct filename if needed
+    local tmp_sha=""
+    if ! grep -qE "[[:space:]]${payload_base}$" "${sha_dir}/${sha_base}"; then
+        tmp_sha="$(mktemp)"
+        awk -v f="${payload_base}" '{print $1"  "f}' "${sha_dir}/${sha_base}" > "${tmp_sha}" || {
+            log_error "Failed to create checksum file"
+            return 1
+        }
+    fi
+
+    log_info "Verifying ${label} SHA256..."
+    local result=0
+    if [ -n "${tmp_sha}" ]; then
+        if (cd "${payload_dir}" && sha256sum -c "${tmp_sha}" >/dev/null 2>&1); then
+            log_info "${label} SHA256: OK"
+        else
+            log_error "${label} SHA256: FAILED"
+            result=1
+        fi
+        rm -f "${tmp_sha}"
+    else
+        if (cd "${payload_dir}" && sha256sum -c "${sha_dir}/${sha_base}" >/dev/null 2>&1); then
+            log_info "${label} SHA256: OK"
+        else
+            log_error "${label} SHA256: FAILED"
+            result=1
+        fi
+    fi
+
+    return $result
+}
+
+# ===== Get security partition device =====
+get_security_partition() {
+    local security_part=""
+
+    # Try to find by by-name link first
+    if [ -e "${SECURITY_PART}" ]; then
+        security_part="${SECURITY_PART}"
+    else
+        # Fallback: search partitions by PARTNAME
+        for entry in /sys/block/mmcblk*/mmcblk*p*; do
+            if [ -f "$entry/uevent" ]; then
+                local name=$(grep PARTNAME "$entry/uevent" 2>/dev/null | cut -d= -f2)
+                if [ "$name" = "security" ]; then
+                    security_part="/dev/$(basename "$entry")"
+                    break
+                fi
+            fi
+        done
+    fi
+
+    echo "$security_part"
+}
+
+# ===== Check OTA trigger =====
+check_ota_trigger() {
+    local security_part=""
+    local last_byte=""
+
+    security_part=$(get_security_partition)
+
+    if [ -z "$security_part" ]; then
+        log_info "Security partition not found"
+        return 1
+    fi
+
+    # Read the last byte from the security partition
+    last_byte=$(dd if="$security_part" bs=512 skip=$(($(blockdev --getsz "$security_part") - 1)) count=1 2>/dev/null | tail -c 1 | od -tx1 -An | tr -d ' ')
+
+    if [ "$last_byte" = "aa" ] || [ "$last_byte" = "AA" ]; then
+        log_info "OTA trigger is set (0xAA)"
+        return 0
+    else
+        log_info "OTA trigger not set (last byte: 0x${last_byte:-<empty>})"
+        return 1
+    fi
+}
+
+# ===== Set OTA trigger =====
+set_ota_trigger() {
+    local security_part=""
+    security_part=$(get_security_partition)
+
+    if [ -z "$security_part" ]; then
+        log_error "Security partition not found, cannot set OTA trigger"
+        return 1
+    fi
+
+    log_info "Setting OTA trigger on $security_part"
+
+    local sector_size=512
+    local total_sectors=$(blockdev --getsz "$security_part")
+    local last_sector=$((total_sectors - 1))
+    local temp_file=$(mktemp)
+
+    if dd if="$security_part" bs="$sector_size" skip="$last_sector" count=1 of="$temp_file" 2>/dev/null; then
+        printf '\xaa' | dd of="$temp_file" bs=1 seek=511 count=1 conv=notrunc 2>/dev/null
+        if dd if="$temp_file" of="$security_part" bs="$sector_size" seek="$last_sector" count=1 conv=notrunc 2>/dev/null; then
+            log_info "OTA trigger set successfully"
+        else
+            log_error "Failed to write trigger to $security_part"
+            rm -f "$temp_file"
+            return 1
+        fi
+    else
+        log_error "Failed to read from $security_part"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    rm -f "$temp_file"
+    return 0
+}
+
+# ===== Clear OTA trigger =====
+clear_ota_trigger() {
+    local security_part=""
+    security_part=$(get_security_partition)
+
+    if [ -z "$security_part" ]; then
+        log_warn "Security partition not found, cannot clear trigger"
+        return 1
+    fi
+
+    log_info "Clearing OTA trigger on $security_part"
+
+    local sector_size=512
+    local total_sectors=$(blockdev --getsz "$security_part")
+    local last_sector=$((total_sectors - 1))
+    local temp_file=$(mktemp)
+
+    if ! dd if="$security_part" bs="$sector_size" skip="$last_sector" count=1 of="$temp_file" 2>/dev/null; then
+        log_error "Failed to read from $security_part"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    # Modify the last byte to 0x00
+    printf '\x00' | dd of="$temp_file" bs=1 seek=511 count=1 conv=notrunc 2>/dev/null
+
+    if ! dd if="$temp_file" of="$security_part" bs="$sector_size" seek="$last_sector" count=1 conv=notrunc 2>/dev/null; then
+        log_error "Failed to clear trigger on $security_part"
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    rm -f "$temp_file"
+
+    # Verify
+    local new_last_byte=$(dd if="$security_part" bs=512 skip=$last_sector count=1 2>/dev/null | tail -c 1 | od -tx1 -An | tr -d ' ')
+    if [ "$new_last_byte" = "00" ]; then
+        log_info "OTA trigger cleared successfully"
+        return 0
+    else
+        log_error "Failed to clear trigger (last byte: 0x${new_last_byte})"
+        return 1
+    fi
+}
+
+# ===== Write boot.itb to boot partition =====
+write_boot_itb() {
+    local boot_itb="$1"
+    local boot_dev="${2:-/dev/mmcblk0p1}"
+
+    log_info "Writing boot.itb to ${boot_dev}..."
+
+    # Check boot partition type
+    local boot_fs_type=$(blkid -o value -s TYPE "$boot_dev" 2>/dev/null || echo "")
+
+    if [ "$boot_fs_type" != "ext4" ]; then
+        log_info "Boot partition is not ext4 (type: $boot_fs_type), using dd to write boot.itb"
+        if dd if="$boot_itb" of="$boot_dev" bs=1M conv=fsync; then
+            log_info "Successfully wrote boot.itb to ${boot_dev}"
+            sync
+            return 0
+        else
+            log_error "Failed to write boot.itb"
+            return 1
+        fi
+    else
+        log_info "Boot partition is ext4, boot.itb will be handled by initramfs OTA process"
+        return 0
+    fi
+}
+
+# ===== Detect kernel version =====
+detect_kver() {
+    local files
+    files=(/boot/initrd.img-*)
+
+    if [ ! -e "${files[0]}" ]; then
+        log_error "No initrd.img-* found under /boot"
+        return 1
+    fi
+
+    # Filter to existing files
+    local real_files=()
+    for f in "${files[@]}"; do
+        [ -e "$f" ] && real_files+=("$f")
+    done
+
+    if [ "${#real_files[@]}" -eq 0 ]; then
+        log_error "No valid initrd.img-* files found"
+        return 1
+    fi
+
+    # Only one file
+    if [ "${#real_files[@]}" -eq 1 ]; then
+        local base
+        base="$(basename "${real_files[0]}")"
+        echo "${base#initrd.img-}"
+        return 0
+    fi
+
+    # Prefer uname -r
+    local uname_k
+    uname_k="$(uname -r)"
+    if [ -f "/boot/initrd.img-${uname_k}" ]; then
+        echo "${uname_k}"
+        return 0
+    fi
+
+    # Pick newest
+    local newest
+    newest="$(ls -1t /boot/initrd.img-* 2>/dev/null | head -n1 || true)"
+    if [ -n "$newest" ] && [ -f "$newest" ]; then
+        local base
+        base="$(basename "$newest")"
+        echo "${base#initrd.img-}"
+        return 0
+    fi
+
+    log_error "Failed to determine kernel version"
+    return 1
+}
+
+# ===== Install initramfs hooks =====
+install_initramfs_hooks() {
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    log_info "Installing initramfs hooks..."
+
+    # Copy hooks
+    if [ -f "${script_dir}/initramfs_hooks/99-copy-tools" ]; then
+        cp "${script_dir}/initramfs_hooks/99-copy-tools" /etc/initramfs-tools/hooks/ || {
+            log_error "Failed to copy 99-copy-tools hook"
+            return 1
+        }
+        chmod 755 /etc/initramfs-tools/hooks/99-copy-tools
+    else
+        log_error "99-copy-tools not found in ${script_dir}"
+        return 1
+    fi
+
+    # Copy OTA apply script (normal mode) or fit-ota (secure boot mode)
+    if [ $SECURE_BOOT -eq 1 ]; then
+        if [ -f "${script_dir}/fit/fit-ota" ]; then
+            mkdir -p /etc/initramfs-tools/scripts/init-premount
+            cp "${script_dir}/fit/fit-ota" /etc/initramfs-tools/scripts/init-premount/1-fit-ota || {
+                log_error "Failed to copy fit-ota script"
+                return 1
+            }
+            chmod 755 /etc/initramfs-tools/scripts/init-premount/1-fit-ota
+        else
+            log_error "fit-ota not found in ${script_dir}"
+            return 1
+        fi
+    else
+        if [ -f "${script_dir}/initramfs_hooks/99-ota-apply" ]; then
+            mkdir -p /etc/initramfs-tools/scripts/init-premount
+            cp "${script_dir}/initramfs_hooks/99-ota-apply" /etc/initramfs-tools/scripts/init-premount/ || {
+                log_error "Failed to copy 99-ota-apply script"
+                return 1
+            }
+            chmod 755 /etc/initramfs-tools/scripts/init-premount/99-ota-apply
+        else
+            log_error "99-ota-apply not found in ${script_dir}"
+            return 1
+        fi
+    fi
+
+    # Rebuild initramfs
+    local kver
+    kver=$(detect_kver) || return 1
+
+    log_info "Rebuilding initramfs for kernel: ${kver}"
+    update-initramfs -u -k "${kver}" || {
+        log_error "Failed to rebuild initramfs"
+        return 1
+    }
+
+    log_info "Initramfs updated successfully"
+    return 0
+}
+
+# ===== Prepare OTA =====
+do_prepare_ota() {
+    local ota_package="$1"
+
+    if [ -z "${ota_package}" ]; then
+        log_error "Usage: $0 prepare <ota-package.tar.gz>"
+        exit 1
+    fi
+
+    if [ ! -f "${ota_package}" ]; then
+        log_error "OTA package not found: ${ota_package}"
+        exit 1
+    fi
+
+    log_info "=== Preparing Recovery OTA ==="
+    log_info "OTA package: ${ota_package}"
+
+    # Check if running as root
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        log_error "This command must be run as root:"
+        log_error "  sudo $0 prepare ${ota_package}"
+        exit 1
+    fi
+
+    # Create work directory
+    mkdir -p "${OTA_WORK_DIR}"
+
+    # Extract OTA package
+    log_info "Extracting OTA package to ${OTA_WORK_DIR}"
+    if ! tar -xzf "${ota_package}" -C "${OTA_WORK_DIR}"; then
+        log_error "Failed to extract OTA package"
+        rm -rf "${OTA_WORK_DIR}"
+        exit 1
+    fi
+
+    # Verify rootfs SHA256
+    if [ -f "${ROOTFS_SHA}" ]; then
+        if ! verify_sha256 "${ROOTFS_TAR}" "${ROOTFS_SHA}" "rootfs"; then
+            log_error "Rootfs SHA256 verification failed"
+            rm -rf "${OTA_WORK_DIR}"
+            exit 1
+        fi
+    else
+        log_warn "No rootfs.sha256 found, skipping verification"
+    fi
+
+    # Verify boot SHA256
+    if [ $SECURE_BOOT -eq 1 ] && [ -f "${BOOT_ITB_SHA}" ] && [ -f "${BOOT_ITB}" ]; then
+        if ! verify_sha256 "${BOOT_ITB}" "${BOOT_ITB_SHA}" "boot.itb"; then
+            log_error "Boot.itb SHA256 verification failed"
+            rm -rf "${OTA_WORK_DIR}"
+            exit 1
+        fi
+    elif [ -f "${BOOT_SHA}" ] && [ -f "${BOOT_TAR}" ]; then
+        if ! verify_sha256 "${BOOT_TAR}" "${BOOT_SHA}" "boot.tar.gz"; then
+            log_error "Boot.tar.gz SHA256 verification failed"
+            rm -rf "${OTA_WORK_DIR}"
+            exit 1
+        fi
+    fi
+
+    # Handle boot.itb for secure boot mode
+    if [ $SECURE_BOOT -eq 1 ] && [ -f "${BOOT_ITB}" ]; then
+        log_info "Handling boot.itb..."
+        write_boot_itb "${BOOT_ITB}" || {
+            log_error "Failed to write boot.itb"
+            rm -rf "${WORK_DIR}"
+            exit 1
+        }
+
+        # Set OTA trigger on security partition
+        set_ota_trigger || {
+            log_error "Failed to set OTA trigger"
+            rm -rf "${WORK_DIR}"
+            exit 1
+        }
+
+        log_info "Boot update completed, system ready for OTA"
+        log_info "Next reboot will apply rootfs update automatically"
+    else
+        log_info "No boot.itb or normal mode, OTA will be applied during next boot"
+    fi
+
+    # Install initramfs hooks
+    if ! install_initramfs_hooks; then
+        log_error "Failed to install initramfs hooks"
+        rm -rf "${OTA_WORK_DIR}"
+        exit 1
+    fi
+
+    log_info "=========================================="
+    log_info "OTA preparation completed successfully!"
+    log_info "=========================================="
+    log_info ""
+    log_info "The OTA package has been prepared and verified"
+    log_info "Your current system is still running normally"
+    log_info ""
+    log_info "To apply the OTA update, reboot:"
+    log_info "  reboot"
+    log_info ""
+    log_info "The update will be applied automatically during next boot"
+}
+
+# ===== Show OTA status =====
+do_show_status() {
+    echo "=== Recovery OTA Status ==="
+    echo ""
+
+    echo "System Mode:"
+    if [ $SECURE_BOOT -eq 1 ]; then
+        echo "  Secure Boot: YES"
+        echo "  Auto Decrypt: YES"
+    else
+        echo "  Secure Boot: NO"
+    fi
+    echo ""
+
+    echo "OTA Trigger:"
+    if check_ota_trigger; then
+        echo "  Status: PENDING (0xAA trigger set)"
+        echo "  Action: OTA will be applied on next boot"
+    else
+        echo "  Status: IDLE (no trigger)"
+        echo "  Action: No OTA pending"
+    fi
+    echo ""
+
+    echo "OTA Work Directory:"
+    if [ -d "${OTA_WORK_DIR}" ]; then
+        echo "  Path: ${OTA_WORK_DIR}"
+        echo "  Contents:"
+        ls -la "${OTA_WORK_DIR}" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+    else
+        echo "  Not found (no OTA prepared)"
+    fi
+    echo ""
+
+    echo "Initramfs Hooks:"
+    if [ -f "/etc/initramfs-tools/hooks/99-copy-tools" ]; then
+        echo "  99-copy-tools: INSTALLED"
+    else
+        echo "  99-copy-tools: NOT FOUND"
+    fi
+
+    if [ -f "/etc/initramfs-tools/scripts/init-premount/1-fit-ota" ]; then
+        echo "  1-fit-ota: INSTALLED (secure boot mode)"
+    elif [ -f "/etc/initramfs-tools/scripts/init-premount/99-ota-apply" ]; then
+        echo "  99-ota-apply: INSTALLED (normal mode)"
+    else
+        echo "  OTA apply script: NOT FOUND"
+    fi
+}
+
+# ===== Mark OTA as successful =====
+do_mark_success() {
+    log_info "=== Marking OTA as successful ==="
+
+    # For Recovery OTA, clear the trigger if it's still set
+    if check_ota_trigger; then
+        log_info "Clearing OTA trigger..."
+        clear_ota_trigger || log_error "Failed to clear trigger"
+    else
+        log_info "No OTA trigger to clear"
+    fi
+
+    log_info "OTA marked as successful"
+}
+
+# ===== Rollback OTA (not supported in Recovery OTA) =====
+do_rollback() {
+    log_error "Rollback is not supported in Recovery OTA mode"
+    log_info "Recovery OTA requires manual intervention if update fails"
+    return 1
+}
+
+# ===== Main =====
+case "${1:-}" in
+    prepare)
+        do_prepare_ota "$2"
+        ;;
+    status)
+        do_show_status
+        ;;
+    mark-success)
+        do_mark_success
+        ;;
+    rollback)
+        do_rollback
+        ;;
+    *)
+        echo "Usage: $0 {prepare|status|mark-success|rollback}"
+        echo ""
+        echo "Commands:"
+        echo "  prepare <package>     Prepare OTA from package (verify, extract, setup)"
+        echo "  status                Show OTA status and information"
+        echo "  mark-success          Mark OTA as successful (clear trigger)"
+        echo "  rollback              Rollback to previous version (not supported)"
+        exit 1
+        ;;
+esac

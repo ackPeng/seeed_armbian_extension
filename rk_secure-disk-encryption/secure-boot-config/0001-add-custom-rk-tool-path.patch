@@ -1,0 +1,53 @@
+From ef16d5a806f17d93a204f555735fbae0556db909 Mon Sep 17 00:00:00 2001
+From: ackPeng <1143590135@qq.com>
+Date: Tue, 9 Dec 2025 14:14:02 +0800
+Subject: [PATCH] add-custom-rk-tool-path
+
+---
+ arch/arm/mach-rockchip/make_fit_atf.sh | 2 +-
+ make.sh                                | 8 ++++----
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/arch/arm/mach-rockchip/make_fit_atf.sh b/arch/arm/mach-rockchip/make_fit_atf.sh
+index 045273e3bd0..32ef33b8b02 100755
+--- a/arch/arm/mach-rockchip/make_fit_atf.sh
++++ b/arch/arm/mach-rockchip/make_fit_atf.sh
+@@ -10,7 +10,7 @@ source ./${srctree}/arch/arm/mach-rockchip/fit_nodes.sh
+ gen_header
+ gen_uboot_node
+ gen_bl31_node
+-#gen_bl32_node
++gen_bl32_node
+ gen_mcu_node
+ gen_loadable_node
+ gen_kfdt_node
+diff --git a/make.sh b/make.sh
+index a4a537b7bcd..a4fba07ca89 100755
+--- a/make.sh
++++ b/make.sh
+@@ -12,8 +12,8 @@ CMD_ARGS=$1
+ 
+ ########################################### User can modify #############################################
+ RKBIN_TOOLS=../rkbin/tools
+-CROSS_COMPILE_ARM32=../prebuilts/gcc/linux-x86/arm/gcc-linaro-6.3.1-2017.05-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-
+-CROSS_COMPILE_ARM64=../prebuilts/gcc/linux-x86/aarch64/gcc-linaro-6.3.1-2017.05-x86_64_aarch64-linux-gnu/bin/aarch64-linux-gnu-
++CROSS_COMPILE_ARM32=../prebuilts/gcc/linux-x86/arm/gcc-arm-10.3-2021.07-x86_64-arm-none-linux-gnueabihf/bin/arm-none-linux-gnueabihf- 
++CROSS_COMPILE_ARM64=../prebuilts/gcc/linux-x86/aarch64/gcc-arm-10.3-2021.07-x86_64-aarch64-none-linux-gnu/bin/aarch64-none-linux-gnu-
+ ########################################### User not touch #############################################
+ # Declare global INI file searching index name for every chip, update in select_chip_info()
+ RKCHIP=
+@@ -277,9 +277,9 @@ function select_toolchain()
+ 			CROSS_COMPILE_ARM64=`cat ${CC_FILE}`
+ 		else
+ 			if grep -q '^CONFIG_ARM64=y' .config ; then
+-				CROSS_COMPILE_ARM64=$(cd `dirname ${CROSS_COMPILE_ARM64}`; pwd)"/aarch64-linux-gnu-"
++				CROSS_COMPILE_ARM64=$(cd `dirname ${CROSS_COMPILE_ARM64}`; pwd)"/aarch64-none-linux-gnu-"
+ 			else
+-				CROSS_COMPILE_ARM32=$(cd `dirname ${CROSS_COMPILE_ARM32}`; pwd)"/arm-linux-gnueabihf-"
++				CROSS_COMPILE_ARM32=$(cd `dirname ${CROSS_COMPILE_ARM32}`; pwd)"/arm-none-linux-gnueabihf-"
+ 			fi
+ 		fi
+ 	fi
+-- 
+2.43.0
+

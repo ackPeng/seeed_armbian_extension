@@ -1,0 +1,239 @@
+#!/bin/bash
+#
+# armbian-ota-health-check - Health check script for first boot after OTA
+#
+# This script runs during first boot after OTA to verify system health
+# before marking the OTA as successful.
+#
+
+set -e
+
+# Source common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/lib/common.sh" ]; then
+    . "${SCRIPT_DIR}/lib/common.sh"
+elif [ -f /usr/share/armbian-ota/common.sh ]; then
+    . /usr/share/armbian-ota/common.sh
+else
+    echo "ERROR: Cannot find common.sh library"
+    exit 1
+fi
+
+# Configuration
+HEALTH_CHECK_LOG="/var/log/armbian-ota/health-check.log"
+MAX_CHECK_DURATION=300  # 5 minutes max for all checks
+
+# ===== Health check functions =====
+
+# Check 1: Kernel booted successfully
+check_kernel() {
+    log_info "Checking kernel..."
+    if [ -f /proc/version ]; then
+        local kernel_version=$(uname -r)
+        log_info "Kernel version: ${kernel_version}"
+        return 0
+    else
+        log_error "Kernel check failed: /proc/version not found"
+        return 1
+    fi
+}
+
+# Check 2: Root filesystem is mounted read-write
+check_root_fs() {
+    log_info "Checking root filesystem..."
+    local root_opts=$(findmnt -n -o OPTIONS /)
+    if [[ "${root_opts}" == *rw* ]]; then
+        log_info "Root filesystem is read-write"
+        return 0
+    else
+        log_error "Root filesystem is not read-write (opts: ${root_opts})"
+        return 1
+    fi
+}
+
+# Check 3: Essential filesystems are mounted
+check_filesystems() {
+    log_info "Checking essential filesystems..."
+    local failed=0
+
+    # Check /proc
+    if ! mountpoint -q /proc; then
+        log_error "/proc not mounted"
+        failed=1
+    fi
+
+    # Check /sys
+    if ! mountpoint -q /sys; then
+        log_error "/sys not mounted"
+        failed=1
+    fi
+
+    # Check /dev
+    if ! mountpoint -q /dev; then
+        log_error "/dev not mounted"
+        failed=1
+    fi
+
+    # Check /tmp
+    if ! mountpoint -q /tmp; then
+        log_warn "/tmp not mounted (may be OK)"
+    fi
+
+    if [ $failed -eq 0 ]; then
+        log_info "Essential filesystems OK"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check 4: Systemd is running
+check_systemd() {
+    log_info "Checking systemd..."
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-system-running >/dev/null 2>&1; then
+            local state=$(systemctl is-system-running)
+            log_info "Systemd state: ${state}"
+
+            # Allow degraded state but not failed
+            if [ "${state}" = "failed" ]; then
+                log_error "Systemd is in failed state"
+                return 1
+            fi
+            return 0
+        else
+            log_warn "systemctl is-system-running failed"
+            return 0  # Don't fail on this
+        fi
+    else
+        log_warn "systemctl not found (non-systemd system?)"
+        return 0
+    fi
+}
+
+# Check 5: Network interfaces exist
+check_network() {
+    log_info "Checking network..."
+    local has_interface=0
+
+    # Check for any network interface besides lo
+    for iface in /sys/class/net/*; do
+        local name=$(basename "${iface}")
+        if [ "${name}" != "lo" ]; then
+            has_interface=1
+            log_info "Found network interface: ${name}"
+            break
+        fi
+    done
+
+    if [ $has_interface -eq 1 ]; then
+        return 0
+    else
+        log_warn "No network interface found (may be OK for some systems)"
+        return 0  # Don't fail on this
+    fi
+}
+
+# Check 6: Essential commands work
+check_commands() {
+    log_info "Checking essential commands..."
+    local failed=0
+
+    for cmd in sh bash mount umount reboot; do
+        if ! command -v $cmd >/dev/null 2>&1; then
+            log_error "Missing command: $cmd"
+            failed=1
+        fi
+    done
+
+    if [ $failed -eq 0 ]; then
+        log_info "Essential commands OK"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check 7: SSH daemon (optional)
+check_ssh() {
+    log_info "Checking SSH daemon..."
+    if command -v sshd >/dev/null 2>&1 || command -v dropbear >/dev/null 2>&1; then
+        log_info "SSH daemon found"
+        return 0
+    else
+        log_warn "SSH daemon not found (may be OK)"
+        return 0
+    fi
+}
+
+# Run all health checks
+run_all_checks() {
+    log_info "=== Starting health checks ==="
+
+    local checks=(
+        "check_kernel"
+        "check_root_fs"
+        "check_filesystems"
+        "check_systemd"
+        "check_network"
+        "check_commands"
+        "check_ssh"
+    )
+
+    local passed=0
+    local failed=0
+    local warnings=0
+
+    for check in "${checks[@]}"; do
+        if $check; then
+            ((passed++))
+        else
+            ((failed++))
+        fi
+    done
+
+    log_info "=== Health check results ==="
+    log_info "Passed: ${passed}"
+    log_info "Failed: ${failed}"
+    log_info "Warnings: ${warnings}"
+
+    if [ $failed -eq 0 ]; then
+        log_info "All critical health checks passed!"
+        return 0
+    else
+        log_error "Some health checks failed!"
+        return 1
+    fi
+}
+
+# ===== Main =====
+main() {
+    init_logging
+
+    # Check if this is first boot after OTA
+    local ota_in_progress=$(fw_printenv -n ota_in_progress 2>/dev/null || echo "0")
+
+    if [ "${ota_in_progress}" != "1" ]; then
+        log_info "No OTA in progress, skipping health check"
+        exit 0
+    fi
+
+    # Check if OTA work directory exists (means OTA just happened)
+    if [ ! -d "${OTA_WORK_DIR}" ]; then
+        log_info "No OTA work directory found, skipping health check"
+        exit 0
+    fi
+
+    log_info "Running health check for first boot after OTA"
+
+    # Run health checks
+    if run_all_checks; then
+        log_info "Health check passed"
+        exit 0
+    else
+        log_error "Health check failed"
+        exit 1
+    fi
+}
+
+main "$@"

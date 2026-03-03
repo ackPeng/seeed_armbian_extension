@@ -1,0 +1,20 @@
+[Unit]
+Description=Armbian AB OTA Mark Success
+Documentation=https://docs.armbian.com
+DefaultDependencies=no
+After=armbian-ota-firstboot.service
+Requires=armbian-ota-firstboot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/armbian-ota-manager mark-success
+RemainAfterExit=yes
+TimeoutStartSec=60
+StandardOutput=journal+console
+StandardError=journal+console
+
+# Only run if OTA was in progress (checked inside mark-success command)
+# This will automatically mark successful boot and clear the flag
+
+[Install]
+WantedBy=multi-user.target

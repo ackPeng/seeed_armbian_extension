@@ -1,0 +1,347 @@
+#!/bin/sh
+#
+# initramfs-tools init-premount hook: OTA update
+
+PREREQ=""
+
+prereqs() {
+    echo "$PREREQ"
+}
+
+case "$1" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+# ===== logging: file + /dev/kmsg =====
+LOGDIR=/run/initramfs
+LOGFILE=${LOGDIR}/ota.log
+mkdir -p "$LOGDIR"
+
+# increase printk level so /dev/kmsg goes to console
+echo "8 4 1 7" > /proc/sys/kernel/printk 2>/dev/null || true
+
+log() {
+    echo "OTA_DEBG $*" >> "$LOGFILE" 2>/dev/null || true
+    echo "OTA_DEBG $*" > /dev/kmsg 2>/dev/null || true
+}
+
+# ===== heartbeat for long-running operations =====
+HEARTBEAT_PID=""
+
+start_heartbeat() {
+    msg="$1"
+    (
+        while :; do
+            echo "OTA_DEBG [HB] $msg" >> "$LOGFILE" 2>/dev/null || true
+            echo "OTA_DEBG [HB] $msg" > /dev/kmsg 2>/dev/null || true
+            sleep 10
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+
+stop_heartbeat() {
+    if [ -n "$HEARTBEAT_PID" ]; then
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        HEARTBEAT_PID=""
+    fi
+}
+
+# enable shell trace (goes into log/kmsg)
+set -x
+
+[ -f /scripts/functions ] && . /scripts/functions
+
+# default fallback devices (if detection fails)
+ROOT_DEV=""
+BOOT_DEV=""
+
+ROOT_MNT="/mnt/root"
+BOOT_MNT="/mnt/boot"
+
+OTA_DIR="${ROOT_MNT}/ota_work"
+ROOTFS_TAR="${OTA_DIR}/rootfs.tar.gz"
+BOOT_TAR="${OTA_DIR}/boot.tar.gz"
+
+log "init-premount ota hook start"
+log "LOGFILE=${LOGFILE}"
+
+touch "${LOGDIR}/ota_ran.init-premount"
+
+# ===== helper: get UUID by LABEL using blkid =====
+get_uuid_by_label() {
+    label="$1"
+    blkid 2>/dev/null | awk -v lbl="$label" '
+        /LABEL="/ {
+            l = ""; u = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^LABEL="/) {
+                    x = $i
+                    gsub(/LABEL="/, "", x)
+                    gsub(/"$/, "", x)
+                    l = x
+                }
+                if ($i ~ /^UUID="/) {
+                    y = $i
+                    gsub(/UUID="/, "", y)
+                    gsub(/"$/, "", y)
+                    u = y
+                }
+            }
+            if (l == lbl && u != "") {
+                print u
+                exit
+            }
+        }'
+}
+
+# ===== helper: get DEV + UUID by LABEL (e.g. /dev/mmcblk0p5 + UUID) =====
+get_dev_and_uuid_by_label() {
+    label="$1"
+    blkid 2>/dev/null | awk -v lbl="$label" '
+        $0 ~ ("LABEL=\"" lbl "\"") {
+            dev = $1
+            sub(":", "", dev)  # strip trailing colon
+            uuid = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^UUID="/) {
+                    uuid = $i
+                    gsub(/UUID="/, "", uuid)
+                    gsub(/"$/, "", uuid)
+                    break
+                }
+            }
+            if (uuid != "") {
+                print dev, uuid
+                exit
+            }
+        }'
+}
+
+# ===== auto-detect root/boot dev + uuid by LABEL (armbi_root / armbi_boot) =====
+ROOT_UUID=""
+BOOT_UUID=""
+HAS_BOOT_PART=0
+
+root_info="$(get_dev_and_uuid_by_label "armbi_root" || true)"
+boot_info="$(get_dev_and_uuid_by_label "armbi_boot" || true)"
+
+if [ -n "$root_info" ]; then
+    ROOT_DEV="$(echo "$root_info" | awk '{print $1}')"
+    ROOT_UUID="$(echo "$root_info" | awk '{print $2}')"
+fi
+
+if [ -n "$boot_info" ]; then
+    BOOT_DEV="$(echo "$boot_info" | awk '{print $1}')"
+    BOOT_UUID="$(echo "$boot_info" | awk '{print $2}')"
+    HAS_BOOT_PART=1
+fi
+
+log "auto-detected ROOT_DEV=${ROOT_DEV}, ROOT_UUID=${ROOT_UUID}"
+log "auto-detected BOOT_DEV=${BOOT_DEV}, BOOT_UUID=${BOOT_UUID}, HAS_BOOT_PART=${HAS_BOOT_PART}"
+
+# ===== 1) mount rootfs to /mnt/root =====
+mkdir -p "${ROOT_MNT}"
+log "mounting ${ROOT_DEV} -> ${ROOT_MNT} ..."
+if ! mount -t ext4 -o rw "${ROOT_DEV}" "${ROOT_MNT}"; then
+    log "cannot mount ${ROOT_DEV}, skip OTA"
+    exit 0
+fi
+
+# check OTA payload: rootfs.tar.gz is required, boot.tar.gz is optional
+if [ ! -d "${OTA_DIR}" ] || [ ! -f "${ROOTFS_TAR}" ]; then
+    log "no rootfs OTA payload at ${OTA_DIR}, unmount and skip"
+    umount "${ROOT_MNT}" 2>/dev/null || true
+    exit 0
+fi
+
+HAS_BOOT_TAR=0
+if [ -f "${BOOT_TAR}" ]; then
+    HAS_BOOT_TAR=1
+fi
+
+log "found rootfs OTA payload, HAS_BOOT_PART=${HAS_BOOT_PART}, HAS_BOOT_TAR=${HAS_BOOT_TAR}"
+
+# ===== 2) clean rootfs (except ota_work and boot) =====
+log "cleaning ${ROOT_MNT} (except ota_work ota_work and boot)..."
+start_heartbeat "cleaning rootfs at ${ROOT_MNT}"
+(
+    cd "${ROOT_MNT}" || exit 1
+    for f in * .[!.]* ..?*; do
+        case "$f" in
+            "."|".."|"ota_work"|"boot")
+                continue
+                ;;
+        esac
+        rm -rf "$f"
+    done
+) || {
+    stop_heartbeat
+    log "ERROR: failed to clean ${ROOT_MNT}, abort OTA"
+    umount "${ROOT_MNT}" 2>/dev/null || true
+    exit 0
+}
+stop_heartbeat
+
+# ===== 3) extract rootfs.tar.gz =====
+log "extracting ${ROOTFS_TAR} -> ${ROOT_MNT} ..."
+start_heartbeat "extracting rootfs.tar.gz to ${ROOT_MNT}"
+if ! tar --xattrs --acls --numeric-owner -xpf "${ROOTFS_TAR}" -C "${ROOT_MNT}"; then
+    stop_heartbeat
+    log "ERROR: extract rootfs.tar.gz failed, abort OTA"
+    umount "${ROOT_MNT}" 2>/dev/null || true
+    exit 0
+fi
+stop_heartbeat
+
+sync
+
+# ===== 4) if we have separate boot partition + boot.tar.gz, handle boot OTA =====
+DO_BOOT_OTA=0
+if [ "$HAS_BOOT_PART" -eq 1 ] && [ "$HAS_BOOT_TAR" -eq 1 ]; then
+    DO_BOOT_OTA=1
+fi
+
+if [ "$DO_BOOT_OTA" -eq 1 ]; then
+    log "boot OTA enabled (separate boot partition + boot.tar.gz present)"
+
+    mkdir -p "${BOOT_MNT}"
+    log "mounting ${BOOT_DEV} -> ${BOOT_MNT} ..."
+    if ! mount -t ext4 -o rw "${BOOT_DEV}" "${BOOT_MNT}"; then
+        log "ERROR: mount ${BOOT_DEV} failed, skip boot OTA"
+        BOOT_MNT=""
+        DO_BOOT_OTA=0
+    fi
+else
+    log "boot OTA disabled (no separate boot partition or no boot.tar.gz)"
+fi
+
+if [ "$DO_BOOT_OTA" -eq 1 ]; then
+    # ===== 5) clean boot partition =====
+    # log "cleaning ${BOOT_MNT} ..."
+    # start_heartbeat "cleaning boot at ${BOOT_MNT}"
+    # (
+    #     cd "${BOOT_MNT}" || exit 1
+    #     for f in * .[!.]* ..?*; do
+    #         case "$f" in
+    #             "."|"..")
+    #                 continue
+    #                 ;;
+    #         esac
+    #         rm -rf "$f"
+    #     done
+    # ) || {
+    #     stop_heartbeat
+    #     log "WARN: failed to clean ${BOOT_MNT}, continue anyway"
+    # }
+    # stop_heartbeat
+
+    # ===== 6) extract boot.tar.gz =====
+    log "extracting ${BOOT_TAR} -> ${BOOT_MNT} ..."
+    start_heartbeat "extracting boot.tar.gz to ${BOOT_MNT}"
+    if ! tar --xattrs --acls --numeric-owner -xpf "${BOOT_TAR}" -C "${BOOT_MNT}"; then
+        stop_heartbeat
+        log "ERROR: extract boot.tar.gz failed, system may be broken"
+    fi
+    stop_heartbeat
+
+    sync
+fi
+
+# ===== 7) fix UUIDs in armbianEnv.txt and new rootfs /etc/fstab =====
+
+if [ "$DO_BOOT_OTA" -eq 1 ] && [ -n "${BOOT_MNT}" ]; then
+    ARM_ENV="${BOOT_MNT}/armbianEnv.txt"
+else
+    ARM_ENV="${ROOT_MNT}/boot/armbianEnv.txt"
+fi
+
+FSTAB="${ROOT_MNT}/etc/fstab"
+
+# fallback UUID detection (just in case)
+[ -z "$ROOT_UUID" ] && ROOT_UUID="$(get_uuid_by_label "armbi_root")"
+[ -z "$BOOT_UUID" ] && BOOT_UUID="$(get_uuid_by_label "armbi_boot")"
+
+log "final ROOT_UUID=${ROOT_UUID}, BOOT_UUID=${BOOT_UUID}"
+
+# 7.1 patch armbianEnv.txt if present
+if [ -f "${ARM_ENV}" ]; then
+    log "patching ${ARM_ENV} ..."
+
+    if [ -n "${ROOT_UUID}" ]; then
+        log "  - set rootdev=UUID=${ROOT_UUID}"
+        if grep -q '^rootdev=' "${ARM_ENV}"; then
+            sed -i "s|^rootdev=.*$|rootdev=UUID=${ROOT_UUID}|" "${ARM_ENV}"
+        else
+            printf '\nrootdev=UUID=%s\n' "${ROOT_UUID}" >> "${ARM_ENV}"
+        fi
+    else
+        log "  - WARN: ROOT_UUID empty, skip rootdev change"
+    fi
+
+    # console + verbosity tweaks
+    log "  - insert console=ttyS0,1500000 at first line"
+    sed -i '1iconsole=ttyS0,1500000' "${ARM_ENV}"
+
+    log "  - set verbosity=6"
+    sed -i 's/verbosity=[0-9]/verbosity=6/g' "${ARM_ENV}"
+else
+    log "WARN: ${ARM_ENV} not found, cannot patch rootdev/console/verbosity"
+fi
+
+# 7.2 patch new rootfs /etc/fstab
+if [ -f "${FSTAB}" ]; then
+    log "patching ${FSTAB} ..."
+
+    if [ -n "${ROOT_UUID}" ]; then
+        log "  - update / entry UUID to ${ROOT_UUID}"
+        # lines like: UUID=xxxx / ext4 ...
+        sed -i -E "s|^UUID=[^[:space:]]+[[:space:]]+/[[:space:]]+|UUID=${ROOT_UUID} / |" "${FSTAB}"
+    else
+        log "  - WARN: ROOT_UUID empty, skip / fstab entry update"
+    fi
+
+    if [ -n "${BOOT_UUID}" ]; then
+        log "  - update /boot entry UUID to ${BOOT_UUID}"
+        # lines like: UUID=xxxx /boot ext4 ...
+        sed -i -E "s|^UUID=[^[:space:]]+[[:space:]]+/boot[[:space:]]+|UUID=${BOOT_UUID} /boot |" "${FSTAB}"
+    else
+        log "  - WARN: BOOT_UUID empty, skip /boot fstab entry update"
+    fi
+else
+    log "WARN: ${FSTAB} not found, skip fstab UUID patch"
+fi
+
+sync
+
+log "  delete OTA payload directory ${OTA_DIR} ..."
+rm ${OTA_DIR} -rf || true
+# ===== 8) unmount partitions =====
+if [ "$DO_BOOT_OTA" -eq 1 ] && [ -n "${BOOT_MNT}" ]; then
+    log "unmounting ${BOOT_MNT} ..."
+    umount "${BOOT_MNT}" 2>/dev/null || log "WARN: umount ${BOOT_MNT} failed"
+fi
+
+log "unmounting ${ROOT_MNT} ..."
+umount "${ROOT_MNT}" 2>/dev/null  || log "WARN: umount ${ROOT_MNT} failed"
+
+sync
+
+# ===== 9) reboot =====
+log "OTA done, rebooting..."
+
+if [ -w /proc/sysrq-trigger ]; then
+    echo b > /proc/sysrq-trigger
+fi
+
+if command -v reboot >/dev/null 2>&1; then
+    reboot -f
+fi
+
+while :; do
+    log "reboot failed, please power cycle"
+    sleep 10
+done
