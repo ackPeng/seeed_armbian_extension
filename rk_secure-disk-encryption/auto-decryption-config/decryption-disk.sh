@@ -13,6 +13,25 @@ log_step() {
     fi
 }
 
+get_cmdline_crypt_uuid() {
+    local token value
+    for token in $(cat /proc/cmdline 2>/dev/null); do
+        case "$token" in
+            cryptdevice=UUID=*:*)
+                value="${token#cryptdevice=UUID=}"
+                echo "${value%%:*}"
+                return 0
+                ;;
+            cryptdevice=UUID=*)
+                value="${token#cryptdevice=UUID=}"
+                echo "${value}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 log_step "[Decryption-disk] ENTER 0-decryption-disk"
 
 for disk in /sys/block/*; do
@@ -78,17 +97,29 @@ fi
 if [ -f /tmp/syspw ] && [ -s /tmp/syspw ]; then
     log_step "[Decryption-disk] Password successfully retrieved from security partition"
     PW_LEN="$(wc -c < /tmp/syspw 2>/dev/null || echo 0)"
-    echo "[Decryption-disk] DEBUG password length: ${PW_LEN}"
-    echo "[Decryption-disk] DEBUG password (plain): $(cat /tmp/syspw)"
-    PW_HEX="$(hexdump -v -e '1/1 \"%02x\"' /tmp/syspw 2>/dev/null || od -An -tx1 -v /tmp/syspw | tr -d ' \n')"
-    echo "[Decryption-disk] DEBUG password (hex): ${PW_HEX}"
+    echo "[Decryption-disk] password bytes read: ${PW_LEN}"
 
     # Decrypt LUKS partition
-    # Find LUKS partition directly via blkid
     log_step "[Decryption-disk] Searching for LUKS partitions..."
 
-    # Find LUKS partition
-    ROOT_DEVICE=$(blkid -t TYPE="crypto_LUKS" -o device | head -n1)
+    ROOT_DEVICE=""
+    TARGET_LUKS_UUID="$(get_cmdline_crypt_uuid || true)"
+    if [ -n "$TARGET_LUKS_UUID" ]; then
+        ROOT_DEVICE="$(blkid -t UUID="$TARGET_LUKS_UUID" -o device 2>/dev/null | head -n1)"
+        if [ -n "$ROOT_DEVICE" ]; then
+            ROOT_TYPE="$(blkid -s TYPE -o value "$ROOT_DEVICE" 2>/dev/null || true)"
+            if [ "$ROOT_TYPE" != "crypto_LUKS" ]; then
+                ROOT_DEVICE=""
+            else
+                log_step "[Decryption-disk] Selected LUKS by cmdline UUID: ${TARGET_LUKS_UUID}"
+            fi
+        fi
+    fi
+
+    # Fallback: choose the first LUKS device
+    if [ -z "$ROOT_DEVICE" ]; then
+        ROOT_DEVICE=$(blkid -t TYPE="crypto_LUKS" -o device | head -n1)
+    fi
 
     if [ -z "$ROOT_DEVICE" ]; then
         log_step "[Decryption-disk] Error: No LUKS partition found"

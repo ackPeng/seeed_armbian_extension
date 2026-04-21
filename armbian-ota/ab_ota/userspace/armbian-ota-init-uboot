@@ -81,12 +81,56 @@ get_uboot_bootdev_from_part() {
     return 1
 }
 
-# Detect slot partitions by filesystem label so this works even when
-# extra partitions (BIOS/EFI/etc.) are present before boot_a/rootfs_a.
-boot_a_dev=$(blkid -t LABEL="armbi_boota" -o device 2>/dev/null | head -n1)
-boot_b_dev=$(blkid -t LABEL="armbi_bootb" -o device 2>/dev/null | head -n1)
-root_a_dev=$(blkid -t LABEL="armbi_roota" -o device 2>/dev/null | head -n1)
-root_b_dev=$(blkid -t LABEL="armbi_rootb" -o device 2>/dev/null | head -n1)
+resolve_physical_part_dev() {
+    local dev="$1" pkname
+    [ -n "${dev}" ] || return 1
+
+    case "${dev}" in
+        /dev/mapper/*|/dev/dm-*)
+            pkname="$(lsblk -no PKNAME "${dev}" 2>/dev/null | head -n1)"
+            if [ -n "${pkname}" ]; then
+                echo "/dev/${pkname}"
+                return 0
+            fi
+            ;;
+    esac
+
+    echo "${dev}"
+}
+
+get_part_dev_by_partlabel() {
+    local partlabel="$1" dev
+    dev="$(blkid -t PARTLABEL="${partlabel}" -o device 2>/dev/null | head -n1)"
+    [ -n "${dev}" ] || return 1
+    resolve_physical_part_dev "${dev}"
+}
+
+get_part_uuid() {
+    local dev="$1"
+    [ -n "${dev}" ] || return 1
+    blkid -o value -s UUID "${dev}" 2>/dev/null | head -n1
+}
+
+get_fs_uuid_by_label() {
+    local fslabel="$1"
+    blkid -t LABEL="${fslabel}" -o value -s UUID 2>/dev/null | head -n1
+}
+
+# Detect slot partitions:
+# - boot partitions by filesystem label (ext4 labels armbi_boota/bootb)
+# - root partitions by GPT PARTLABEL first (rootfs_a/rootfs_b), which works
+#   for both normal AB and encrypted AB (rootfs_b is locked by default).
+boot_a_dev="$(blkid -t LABEL="armbi_boota" -o device 2>/dev/null | head -n1)"
+boot_b_dev="$(blkid -t LABEL="armbi_bootb" -o device 2>/dev/null | head -n1)"
+root_a_dev="$(get_part_dev_by_partlabel "rootfs_a" || true)"
+root_b_dev="$(get_part_dev_by_partlabel "rootfs_b" || true)"
+
+if [ -z "${root_a_dev}" ]; then
+    root_a_dev="$(resolve_physical_part_dev "$(blkid -t LABEL="armbi_roota" -o device 2>/dev/null | head -n1)" || true)"
+fi
+if [ -z "${root_b_dev}" ]; then
+    root_b_dev="$(resolve_physical_part_dev "$(blkid -t LABEL="armbi_rootb" -o device 2>/dev/null | head -n1)" || true)"
+fi
 
 if [ -z "${boot_a_dev}" ] || [ -z "${boot_b_dev}" ] || [ -z "${root_a_dev}" ] || [ -z "${root_b_dev}" ]; then
     log_error "Cannot find one or more A/B partitions by label"
@@ -105,16 +149,10 @@ if [ -z "${ACTUAL_BOOT_A_PART}" ] || [ -z "${ACTUAL_BOOT_B_PART}" ] || [ -z "${R
     exit 1
 fi
 
-# Fixed A/B boot partition mapping by design.
-BOOT_A_PART=1
-BOOT_B_PART=2
-
-# Enforce expected mapping to avoid slot confusion.
-if [ "${ACTUAL_BOOT_A_PART}" != "${BOOT_A_PART}" ] || [ "${ACTUAL_BOOT_B_PART}" != "${BOOT_B_PART}" ]; then
-    log_error "Unexpected boot partition layout: boot_a=${boot_a_dev}(p${ACTUAL_BOOT_A_PART}) boot_b=${boot_b_dev}(p${ACTUAL_BOOT_B_PART})"
-    log_error "Expected fixed layout: boot_a=p${BOOT_A_PART}, boot_b=p${BOOT_B_PART}"
-    exit 1
-fi
+# Use detected partition mapping to support custom layouts
+# (for example, with BIOS/EFI/security partitions).
+BOOT_A_PART="${ACTUAL_BOOT_A_PART}"
+BOOT_B_PART="${ACTUAL_BOOT_B_PART}"
 
 BOOT_DEVTYPE=""
 BOOT_DEVNUM=""
@@ -125,10 +163,10 @@ if [ -z "${BOOT_DEVTYPE}" ] || [ -z "${BOOT_DEVNUM}" ]; then
 fi
 
 # Get partition UUIDs
-boot_a_uuid=$(blkid -t LABEL="armbi_boota" -o value -s UUID 2>/dev/null | head -n1)
-boot_b_uuid=$(blkid -t LABEL="armbi_bootb" -o value -s UUID 2>/dev/null | head -n1)
-root_a_uuid=$(blkid -t LABEL="armbi_roota" -o value -s UUID 2>/dev/null | head -n1)
-root_b_uuid=$(blkid -t LABEL="armbi_rootb" -o value -s UUID 2>/dev/null | head -n1)
+boot_a_uuid="$(get_fs_uuid_by_label "armbi_boota")"
+boot_b_uuid="$(get_fs_uuid_by_label "armbi_bootb")"
+root_a_uuid="$(get_part_uuid "${root_a_dev}")"
+root_b_uuid="$(get_part_uuid "${root_b_dev}")"
 
 log_info "Detected partition layout:"
 log_info "  boot_a: ${boot_a_dev} (partition ${BOOT_A_PART})"

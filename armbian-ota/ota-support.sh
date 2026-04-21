@@ -781,17 +781,26 @@ function pre_umount_final_image__894_install_ota_runtime() {
     return 0
 }
 
+function rk_ab_autodecrypt_nonsecure_mode_enabled() {
+	[[ "${AB_PART_OTA}" == "yes" && "${CRYPTROOT_ENABLE}" == "yes" && "${RK_AUTO_DECRYP}" == "yes" && "${RK_SECURE_UBOOT_ENABLE}" != "yes" ]]
+}
+
 function pre_prepare_partitions__ab_part_ota() {
 	if [[ "${AB_PART_OTA}" == "yes" ]]; then
 		USE_HOOK_FOR_PARTITION="yes"
 		AB_BOOT_SIZE=${AB_BOOT_SIZE:-256}  # 256MiB for each boot partition
 		AB_ROOTFS_SIZE=${AB_ROOTFS_SIZE:-4608}  # 4.5GiB for each rootfs partition
+		SECURE_STORAGE_SECURITY_SIZE=${SECURE_STORAGE_SECURITY_SIZE:-4}
         USERDATA=${USERDATA:-256}  # userdata partition by default
         BOOTFS_TYPE="ext4"
         ROOTFS_TYPE="ext4"
         ROOT_FS_LABEL="armbi_roota"
         BOOT_FS_LABEL="armbi_boota"
-		display_alert "A/B partition OTA" "Creating A/B partitions: boot_a, boot_b, rootfs_a, rootfs_b" "info"
+		if rk_ab_autodecrypt_nonsecure_mode_enabled; then
+			display_alert "A/B partition OTA" "Creating A/B encrypted partitions: boot_a, boot_b, security, rootfs_a, rootfs_b, userdata" "info"
+		else
+			display_alert "A/B partition OTA" "Creating A/B partitions: boot_a, boot_b, rootfs_a, rootfs_b, userdata" "info"
+		fi
 	fi
 }
 
@@ -803,6 +812,11 @@ function create_partition_table__ab_part_ota() {
 	local next=${OFFSET} # Starting MiB
 	local p_index=1
 	local script="label: ${IMAGE_PARTITION_TABLE:-gpt}\n"
+	if [[ "${IMAGE_PARTITION_TABLE:-gpt}" == "gpt" ]]; then
+		# Keep GPT entry table compact to reduce SPL malloc pressure when probing partitions.
+		local gpt_table_length="${AB_GPT_TABLE_LENGTH:-64}"
+		script+="table-length: ${gpt_table_length}\n"
+	fi
 
 	# BIOS (if exists)
 	if [[ -n "${BIOSSIZE}" && ${BIOSSIZE} -gt 0 ]]; then
@@ -823,6 +837,13 @@ function create_partition_table__ab_part_ota() {
 	# boot_b
 	script+="${p_index} : name=\"boot_b\", start=${next}MiB, size=${AB_BOOT_SIZE}MiB, type=${boot_type}\n"
 	next=$((next + AB_BOOT_SIZE)); local boot_b_index=${p_index}; p_index=$((p_index+1))
+	# security partition must be between boot_b and rootfs_a in AB+encrypted auto-decrypt mode.
+	local security_index=""
+	if rk_ab_autodecrypt_nonsecure_mode_enabled; then
+		local sec_type="0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+		script+="${p_index} : name=\"security\", start=${next}MiB, size=${SECURE_STORAGE_SECURITY_SIZE}MiB, type=${sec_type}\n"
+		next=$((next + SECURE_STORAGE_SECURITY_SIZE)); security_index=${p_index}; p_index=$((p_index+1))
+	fi
 	# rootfs_a
 	local root_type="${PARTITION_TYPE_UUID_ROOT:-0FC63DAF-8483-4772-8E79-3D69D8477DE4}"
     script+="${p_index} : name=\"rootfs_a\", start=${next}MiB, size=${AB_ROOTFS_SIZE}MiB, type=${root_type}\n"
@@ -842,6 +863,10 @@ function create_partition_table__ab_part_ota() {
 	AB_BOOT_B_PART_INDEX=${boot_b_index}
 	AB_ROOTFS_A_PART_INDEX=${rootfs_a_index}
 	AB_ROOTFS_B_PART_INDEX=${rootfs_b_index}
+	if [[ -n "${security_index}" ]]; then
+		AB_SECURITY_PART_INDEX=${security_index}
+		SECURE_STORAGE_SECURITY_PART_INDEX=${security_index}
+	fi
 	
 	# Set bootpart and rootpart for Armbian partitioning logic
 	bootpart=${boot_a_index}
@@ -866,8 +891,26 @@ function format_partitions__ab_part_ota() {
 	if [[ -n "${AB_ROOTFS_B_PART_INDEX}" ]]; then
 		local rootfs_b_dev="${LOOP}p${AB_ROOTFS_B_PART_INDEX}"
         check_loop_device "$rootfs_b_dev"
-		display_alert "A/B partition OTA" "Formatting rootfs_b (${rootfs_b_dev}) as ext4 with label armbi_rootb" "info"
-		run_host_command_logged mkfs.ext4 -q -L armbi_rootb "${rootfs_b_dev}" || display_alert "A/B partition OTA" "Failed to format rootfs_b" "warn"
+		if rk_ab_autodecrypt_nonsecure_mode_enabled; then
+			local mapper_name="armbian-rootb-build"
+			local mapper_dev="/dev/mapper/${mapper_name}"
+			[[ -n "${CRYPTROOT_PASSPHRASE}" ]] || exit_with_error "A/B encrypted OTA requires CRYPTROOT_PASSPHRASE for rootfs_b LUKS format" "AB_PART_OTA=yes CRYPTROOT_ENABLE=yes RK_AUTO_DECRYP=yes"
+			command -v cryptsetup >/dev/null 2>&1 || exit_with_error "cryptsetup not found while formatting encrypted rootfs_b" "host dependency missing"
+
+			display_alert "A/B partition OTA" "Formatting rootfs_b (${rootfs_b_dev}) as LUKS + ext4(label=armbi_rootb)" "info"
+			printf "%s" "${CRYPTROOT_PASSPHRASE}" | run_host_command_logged cryptsetup luksFormat ${CRYPTROOT_PARAMETERS} "${rootfs_b_dev}" - ||
+				exit_with_error "A/B encrypted OTA failed to luksFormat rootfs_b" "${rootfs_b_dev}"
+			printf "%s" "${CRYPTROOT_PASSPHRASE}" | run_host_command_logged cryptsetup luksOpen "${rootfs_b_dev}" "${mapper_name}" - ||
+				exit_with_error "A/B encrypted OTA failed to luksOpen rootfs_b" "${rootfs_b_dev}"
+			run_host_command_logged mkfs.ext4 -q -L armbi_rootb "${mapper_dev}" || {
+				run_host_command_logged cryptsetup luksClose "${mapper_name}" || true
+				exit_with_error "A/B encrypted OTA failed to mkfs rootfs_b mapper" "${mapper_dev}"
+			}
+			run_host_command_logged cryptsetup luksClose "${mapper_name}" || exit_with_error "A/B encrypted OTA failed to luksClose rootfs_b mapper" "${mapper_name}"
+		else
+			display_alert "A/B partition OTA" "Formatting rootfs_b (${rootfs_b_dev}) as ext4 with label armbi_rootb" "info"
+			run_host_command_logged mkfs.ext4 -q -L armbi_rootb "${rootfs_b_dev}" || display_alert "A/B partition OTA" "Failed to format rootfs_b" "warn"
+		fi
 	fi
 
 	# Format userdata as ext4 with label armbi_usrdata
@@ -887,7 +930,11 @@ function format_partitions__ab_part_ota() {
 
 function prepare_image_size__ab_part_ota() {
 	if [[ "${AB_PART_OTA}" == "yes" ]]; then
-		FIXED_IMAGE_SIZE=$(((AB_ROOTFS_SIZE * 2) + $OFFSET + (AB_BOOT_SIZE * 2) + $UEFISIZE + $EXTRA_ROOTFS_MIB_SIZE + $USERDATA)) # MiB
+		local security_extra_size=0
+		if rk_ab_autodecrypt_nonsecure_mode_enabled; then
+			security_extra_size=${SECURE_STORAGE_SECURITY_SIZE:-4}
+		fi
+		FIXED_IMAGE_SIZE=$(((AB_ROOTFS_SIZE * 2) + OFFSET + (AB_BOOT_SIZE * 2) + UEFISIZE + EXTRA_ROOTFS_MIB_SIZE + USERDATA + security_extra_size)) # MiB
 		display_alert "A/B partition OTA" "Setting FIXED_IMAGE_SIZE to ${FIXED_IMAGE_SIZE} MiB for equal rootfs_a and rootfs_b" "info"
 	fi
 }

@@ -9,17 +9,221 @@ BOOT_A_LABEL="armbi_boota"
 BOOT_B_LABEL="armbi_bootb"
 ROOT_A_LABEL="armbi_roota"
 ROOT_B_LABEL="armbi_rootb"
+AB_OTA_BYNAME_DIR="/dev/block/by-name"
+AB_OTA_SYSPW_FILE="/tmp/syspw"
+AB_OTA_TEE_LOG="/tmp/armbian-ota-tee-supplicant.log"
+AB_OTA_KEYBOX_LOG="/tmp/armbian-ota-keybox.log"
+AB_OTA_TEE_PID=""
+
+ab_get_slot_partlabel_by_fslabel() {
+    case "$1" in
+        "${BOOT_A_LABEL}") echo "boot_a" ;;
+        "${BOOT_B_LABEL}") echo "boot_b" ;;
+        "${ROOT_A_LABEL}") echo "rootfs_a" ;;
+        "${ROOT_B_LABEL}") echo "rootfs_b" ;;
+        *) echo "" ;;
+    esac
+}
+
+ab_resolve_physical_part_dev() {
+    local dev="$1" pkname
+    [ -n "${dev}" ] || return 1
+
+    case "${dev}" in
+        /dev/mapper/*|/dev/dm-*)
+            pkname="$(lsblk -no PKNAME "${dev}" 2>/dev/null | head -n1)"
+            if [ -n "${pkname}" ]; then
+                echo "/dev/${pkname}"
+                return 0
+            fi
+            ;;
+    esac
+
+    echo "${dev}"
+}
 
 ab_get_part_by_label() {
-    blkid -t LABEL="$1" -o device 2>/dev/null | head -n1
+    local label="$1" dev partlabel
+
+    dev="$(blkid -t LABEL="${label}" -o device 2>/dev/null | head -n1)"
+    if [ -n "${dev}" ]; then
+        ab_resolve_physical_part_dev "${dev}"
+        return 0
+    fi
+
+    partlabel="$(ab_get_slot_partlabel_by_fslabel "${label}")"
+    if [ -n "${partlabel}" ]; then
+        dev="$(blkid -t PARTLABEL="${partlabel}" -o device 2>/dev/null | head -n1)"
+        if [ -n "${dev}" ]; then
+            ab_resolve_physical_part_dev "${dev}"
+            return 0
+        fi
+    fi
+
+    echo ""
 }
 
 ab_get_uuid_by_label() {
-    blkid -t LABEL="$1" -o value -s UUID 2>/dev/null | head -n1
+    local label="$1" dev uuid
+    dev="$(ab_get_part_by_label "${label}")"
+    if [ -n "${dev}" ]; then
+        uuid="$(blkid -s UUID -o value "${dev}" 2>/dev/null | head -n1)"
+        if [ -n "${uuid}" ]; then
+            echo "${uuid}"
+            return 0
+        fi
+    fi
+
+    blkid -t LABEL="${label}" -o value -s UUID 2>/dev/null | head -n1
+}
+
+ab_get_security_part() {
+    local dev
+    dev="$(blkid -t PARTLABEL=security -o device 2>/dev/null | head -n1)"
+    if [ -z "${dev}" ]; then
+        dev="$(blkid -t LABEL=security -o device 2>/dev/null | head -n1)"
+    fi
+    echo "${dev}"
+}
+
+ab_prepare_byname_links() {
+    local disk disk_name entry devnode name sec_dev
+
+    mkdir -p "${AB_OTA_BYNAME_DIR}" 2>/dev/null || true
+
+    for disk in /sys/block/*; do
+        disk_name="$(basename "${disk}")"
+        case "${disk_name}" in
+            loop*|ram*|zram*|dm-*|mtdblock*)
+                continue
+                ;;
+        esac
+
+        for entry in "${disk}"/"${disk_name}"*; do
+            [ -d "${entry}" ] || continue
+            [ -f "${entry}/partition" ] || continue
+
+            devnode="/dev/$(basename "${entry}")"
+            name="$(sed -n 's/^PARTNAME=//p' "${entry}/uevent" | head -n1)"
+            [ -n "${name}" ] || continue
+            ln -sf "${devnode}" "${AB_OTA_BYNAME_DIR}/${name}" 2>/dev/null || true
+        done
+    done
+
+    sec_dev="$(ab_get_security_part)"
+    if [ -n "${sec_dev}" ]; then
+        ln -sf "${sec_dev}" "${AB_OTA_BYNAME_DIR}/security" 2>/dev/null || true
+    fi
+}
+
+ab_start_tee_supplicant() {
+    AB_OTA_TEE_PID=""
+
+    [ -x /usr/bin/tee-supplicant ] || return 0
+
+    # A stale tee-supplicant from initramfs may still hold /dev/teepriv0.
+    # Restart it in current rootfs namespace so keybox_app can access TA assets.
+    pkill -9 -x tee-supplicant >/dev/null 2>&1 || true
+    sleep 1
+
+    /usr/bin/tee-supplicant >"${AB_OTA_TEE_LOG}" 2>&1 &
+    AB_OTA_TEE_PID="$!"
+    sleep 1
+    if ! kill -0 "${AB_OTA_TEE_PID}" 2>/dev/null; then
+        [ -f "${AB_OTA_TEE_LOG}" ] && log_error "tee-supplicant log: $(tail -n 1 "${AB_OTA_TEE_LOG}")"
+        return 1
+    fi
+    return 0
+}
+
+ab_stop_tee_supplicant() {
+    if [ -n "${AB_OTA_TEE_PID}" ] && kill -0 "${AB_OTA_TEE_PID}" 2>/dev/null; then
+        kill "${AB_OTA_TEE_PID}" >/dev/null 2>&1 || true
+        wait "${AB_OTA_TEE_PID}" 2>/dev/null || true
+    fi
+    AB_OTA_TEE_PID=""
+}
+
+ab_get_security_passphrase_file() {
+    local out_file="$1"
+    local security_dev marker
+
+    [ -n "${out_file}" ] || return 1
+    : > "${out_file}" || return 1
+    chmod 600 "${out_file}" 2>/dev/null || true
+
+    # Keep the same preparation steps as initramfs decryption script.
+    ab_prepare_byname_links
+
+    security_dev="${AB_OTA_BYNAME_DIR}/security"
+    if [ ! -e "${security_dev}" ]; then
+        security_dev="$(ab_get_security_part)"
+    fi
+    [ -n "${security_dev}" ] || {
+        log_error "Security partition not found"
+        return 1
+    }
+
+    marker="$(head -c 4 "${security_dev}" 2>/dev/null || true)"
+    log_info "Security partition marker: ${marker:-<empty>}"
+
+    export SECURITY_STORAGE=SECURITY
+
+    rm -f "${AB_OTA_SYSPW_FILE}" 2>/dev/null || true
+
+    if [ "${marker}" = "SSKR" ]; then
+        [ -x /usr/bin/keybox_app ] || {
+            log_error "SSKR marker detected but /usr/bin/keybox_app is missing"
+            return 1
+        }
+
+        ab_start_tee_supplicant || {
+            log_error "Failed to start tee-supplicant in rootfs path"
+            return 1
+        }
+        if ! /usr/bin/keybox_app >"${AB_OTA_KEYBOX_LOG}" 2>&1; then
+            ab_stop_tee_supplicant
+            log_error "keybox_app read failed in rootfs path"
+            [ -f "${AB_OTA_KEYBOX_LOG}" ] && log_error "keybox_app log: $(tail -n 1 "${AB_OTA_KEYBOX_LOG}")"
+            return 1
+        fi
+        ab_stop_tee_supplicant
+
+        if [ ! -s "${AB_OTA_SYSPW_FILE}" ]; then
+            log_error "keybox_app did not produce ${AB_OTA_SYSPW_FILE}"
+            return 1
+        fi
+        cp "${AB_OTA_SYSPW_FILE}" "${out_file}" || return 1
+        return 0
+    fi
+
+    # Non-SSKR path: same idea as initramfs (read raw 64 bytes first).
+    if ! head -c 64 "${security_dev}" > "${out_file}" 2>/dev/null; then
+        log_error "Failed to read raw passphrase from ${security_dev}"
+        return 1
+    fi
+
+    # Try keybox write/read round-trip as in initramfs script; fallback to raw on failure.
+    if [ -x /usr/bin/keybox_app ]; then
+        cp "${out_file}" "${AB_OTA_SYSPW_FILE}" 2>/dev/null || true
+        ab_start_tee_supplicant || {
+            log_warn "Failed to start tee-supplicant in non-SSKR path; keep raw key fallback"
+            return 0
+        }
+        /usr/bin/keybox_app write >"${AB_OTA_KEYBOX_LOG}" 2>&1 || true
+        rm -f "${AB_OTA_SYSPW_FILE}" 2>/dev/null || true
+        /usr/bin/keybox_app >"${AB_OTA_KEYBOX_LOG}" 2>&1 || true
+        ab_stop_tee_supplicant
+        if [ -s "${AB_OTA_SYSPW_FILE}" ]; then
+            cp "${AB_OTA_SYSPW_FILE}" "${out_file}" 2>/dev/null || true
+        fi
+    fi
+
+    return 0
 }
 
 ab_get_current_slot() {
-    local root_dev root_uuid root_a_uuid root_b_uuid
+    local root_dev root_part root_partlabel root_uuid root_a_uuid root_b_uuid
     root_dev=""
 
     if findmnt -n /media/root-ro >/dev/null 2>&1; then
@@ -35,6 +239,19 @@ ab_get_current_slot() {
     fi
 
     if [ -n "${root_dev}" ]; then
+        root_part="$(ab_resolve_physical_part_dev "${root_dev}" || true)"
+        root_partlabel="$(blkid -s PARTLABEL -o value "${root_part}" 2>/dev/null || true)"
+        case "${root_partlabel}" in
+            rootfs_a)
+                echo "a"
+                return 0
+                ;;
+            rootfs_b)
+                echo "b"
+                return 0
+                ;;
+        esac
+
         root_uuid="$(blkid -o value -s UUID "${root_dev}" 2>/dev/null)"
         root_a_uuid="$(ab_get_uuid_by_label "${ROOT_A_LABEL}")"
         root_b_uuid="$(ab_get_uuid_by_label "${ROOT_B_LABEL}")"
@@ -99,7 +316,7 @@ ab_get_retry_max() {
 ab_require_tools() {
     ensure_root
     init_logging
-    ensure_command fw_printenv fw_setenv blkid mount umount tar findmnt sed grep awk reboot
+    ensure_command fw_printenv fw_setenv blkid mount umount tar findmnt sed grep awk reboot dd
     acquire_lock || error_exit "Cannot acquire OTA lock"
 }
 
@@ -146,7 +363,9 @@ ab_update_target_partition() {
     local target_boot_label="$3"
     local target_slot target_root_dev target_boot_dev root_mnt boot_mnt
     local target_root_uuid target_boot_uuid existing_root_uuid existing_boot_uuid
-    local fstab arm_env
+    local fstab arm_env crypttab
+    local target_root_type target_root_mount_dev target_root_luks_uuid
+    local security_dev key_file luks_mapper luks_opened
 
     target_slot=""
     if [ "${target_root_label}" = "${ROOT_A_LABEL}" ]; then
@@ -159,10 +378,48 @@ ab_update_target_partition() {
     target_boot_dev="$(ab_get_part_by_label "${target_boot_label}")"
     [ -n "${target_root_dev}" ] || error_exit "Cannot find target root partition: ${target_root_label}"
 
-    log_info "Updating slot ${target_slot}: root=${target_root_dev} boot=${target_boot_dev:-<none>}"
+    target_root_type="$(blkid -o value -s TYPE "${target_root_dev}" 2>/dev/null || true)"
+    target_root_mount_dev="${target_root_dev}"
+    target_root_luks_uuid=""
+    security_dev=""
+    key_file=""
+    luks_mapper=""
+    luks_opened=0
+
+    if [ "${target_root_type}" = "crypto_LUKS" ]; then
+        command -v cryptsetup >/dev/null 2>&1 || error_exit "cryptsetup is required for encrypted AB OTA target partition"
+        security_dev="$(ab_get_security_part)"
+        [ -n "${security_dev}" ] || error_exit "Security partition not found for encrypted AB OTA"
+
+        key_file="$(mktemp)"
+        if ! ab_get_security_passphrase_file "${key_file}"; then
+            rm -f "${key_file}" 2>/dev/null || true
+            error_exit "Failed to obtain decryption passphrase from security flow (${security_dev})"
+        fi
+
+        luks_mapper="armbian-ota-root-${target_slot}"
+        if [ -e "/dev/mapper/${luks_mapper}" ]; then
+            cryptsetup luksClose "${luks_mapper}" >/dev/null 2>&1 || true
+        fi
+        cat "${key_file}" | cryptsetup luksOpen "${target_root_dev}" "${luks_mapper}" ||
+            cryptsetup luksOpen "${target_root_dev}" "${luks_mapper}" --key-file "${key_file}" ||
+            { rm -f "${key_file}" 2>/dev/null || true; error_exit "Failed to unlock encrypted target root ${target_root_dev}"; }
+        rm -f "${key_file}" 2>/dev/null || true
+        key_file=""
+
+        target_root_mount_dev="/dev/mapper/${luks_mapper}"
+        target_root_luks_uuid="$(blkid -s UUID -o value "${target_root_dev}" 2>/dev/null || true)"
+        luks_opened=1
+        log_info "Encrypted target slot ${target_slot}: root=${target_root_dev} mapper=${target_root_mount_dev}"
+    else
+        log_info "Updating slot ${target_slot}: root=${target_root_dev} boot=${target_boot_dev:-<none>}"
+    fi
 
     root_mnt="$(mktemp -d)"
-    mount -t ext4 -o rw "${target_root_dev}" "${root_mnt}" || {
+    mount -t ext4 -o rw "${target_root_mount_dev}" "${root_mnt}" || {
+        if [ "${luks_opened}" -eq 1 ] && [ -n "${luks_mapper}" ]; then
+            cryptsetup luksClose "${luks_mapper}" >/dev/null 2>&1 || true
+        fi
         rm -rf "${root_mnt}"
         error_exit "Failed to mount target root partition"
     }
@@ -181,6 +438,9 @@ ab_update_target_partition() {
 
     tar --xattrs --acls --numeric-owner -xzf "${temp_work}/${AB_OTA_ROOTFS_TAR}" -C "${root_mnt}" || {
         umount "${root_mnt}" 2>/dev/null || true
+        if [ "${luks_opened}" -eq 1 ] && [ -n "${luks_mapper}" ]; then
+            cryptsetup luksClose "${luks_mapper}" >/dev/null 2>&1 || true
+        fi
         rm -rf "${root_mnt}"
         error_exit "Failed to extract rootfs payload"
     }
@@ -209,16 +469,24 @@ ab_update_target_partition() {
         rm -rf "${boot_mnt}"
     fi
 
-    target_root_uuid="$(ab_get_uuid_by_label "${target_root_label}")"
+    if [ "${target_root_type}" = "crypto_LUKS" ]; then
+        target_root_uuid="${target_root_luks_uuid}"
+    else
+        target_root_uuid="$(ab_get_uuid_by_label "${target_root_label}")"
+    fi
     target_boot_uuid="$(ab_get_uuid_by_label "${target_boot_label}")"
     fstab="${root_mnt}/etc/fstab"
+    crypttab="${root_mnt}/etc/crypttab"
 
     if [ -f "${fstab}" ]; then
         cp "${fstab}" "${fstab}.ota-backup"
         existing_root_uuid="$(grep -m1 'UUID=[0-9a-f-]*[[:space:]]*[[:space:]]*/[[:space:]]' "${fstab}" | sed -n 's/.*UUID=\([0-9a-f-]*\).*/\1/p')"
         existing_boot_uuid="$(grep -m1 'UUID=[0-9a-f-]*[[:space:]]*[[:space:]]*/boot[[:space:]]' "${fstab}" | sed -n 's/.*UUID=\([0-9a-f-]*\).*/\1/p')"
 
-        if [ -n "${existing_root_uuid}" ] && [ -n "${target_root_uuid}" ]; then
+        if [ "${target_root_type}" = "crypto_LUKS" ]; then
+            sed -i -E 's|^UUID=[^[:space:]]+[[:space:]]+/[[:space:]]+|/dev/mapper/armbian-root / |' "${fstab}"
+            sed -i -E 's|^/dev/[^[:space:]]+[[:space:]]+/[[:space:]]+|/dev/mapper/armbian-root / |' "${fstab}"
+        elif [ -n "${existing_root_uuid}" ] && [ -n "${target_root_uuid}" ]; then
             sed -i "s|UUID=${existing_root_uuid}|UUID=${target_root_uuid}|g" "${fstab}"
         fi
         if [ -n "${existing_boot_uuid}" ] && [ -n "${target_boot_uuid}" ]; then
@@ -231,17 +499,36 @@ ab_update_target_partition() {
         sed -i "s|LABEL=armbi_bootb|LABEL=${target_boot_label}|g" "${fstab}"
     fi
 
+    if [ "${target_root_type}" = "crypto_LUKS" ] && [ -f "${crypttab}" ] && [ -n "${target_root_uuid}" ]; then
+        sed -i -E "s|^(armbian-root[[:space:]]+)UUID=[0-9a-fA-F-]+|\\1UUID=${target_root_uuid}|" "${crypttab}"
+    fi
+
     arm_env=""
     if [ -n "${target_boot_dev}" ] && [ -b "${target_boot_dev}" ]; then
         boot_mnt="$(mktemp -d)"
         if mount -t ext4 -o rw "${target_boot_dev}" "${boot_mnt}"; then
             arm_env="${boot_mnt}/armbianEnv.txt"
-            if [ -f "${arm_env}" ] && [ -n "${target_root_uuid}" ]; then
-                if grep -q '^rootdev=' "${arm_env}"; then
-                    sed -i "s|^rootdev=UUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
-                    sed -i "s|^rootdev=PARTUUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
-                else
-                    printf '\nrootdev=UUID=%s\n' "${target_root_uuid}" >> "${arm_env}"
+            if [ -f "${arm_env}" ]; then
+                if [ "${target_root_type}" = "crypto_LUKS" ]; then
+                    if grep -q '^rootdev=' "${arm_env}"; then
+                        sed -i 's|^rootdev=.*$|rootdev=/dev/mapper/armbian-root|' "${arm_env}"
+                    else
+                        printf '\nrootdev=/dev/mapper/armbian-root\n' >> "${arm_env}"
+                    fi
+                    if [ -n "${target_root_uuid}" ]; then
+                        if grep -q '^cryptdevice=' "${arm_env}"; then
+                            sed -i "s|^cryptdevice=.*$|cryptdevice=UUID=${target_root_uuid}:armbian-root|" "${arm_env}"
+                        else
+                            printf 'cryptdevice=UUID=%s:armbian-root\n' "${target_root_uuid}" >> "${arm_env}"
+                        fi
+                    fi
+                elif [ -n "${target_root_uuid}" ]; then
+                    if grep -q '^rootdev=' "${arm_env}"; then
+                        sed -i "s|^rootdev=UUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+                        sed -i "s|^rootdev=PARTUUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+                    else
+                        printf '\nrootdev=UUID=%s\n' "${target_root_uuid}" >> "${arm_env}"
+                    fi
                 fi
             fi
             umount "${boot_mnt}" 2>/dev/null || true
@@ -249,18 +536,36 @@ ab_update_target_partition() {
         rm -rf "${boot_mnt}"
     fi
 
-    if [ -z "${arm_env}" ] && [ -f "${root_mnt}/boot/armbianEnv.txt" ] && [ -n "${target_root_uuid}" ]; then
+    if [ -z "${arm_env}" ] && [ -f "${root_mnt}/boot/armbianEnv.txt" ]; then
         arm_env="${root_mnt}/boot/armbianEnv.txt"
-        if grep -q '^rootdev=' "${arm_env}"; then
-            sed -i "s|^rootdev=UUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
-            sed -i "s|^rootdev=PARTUUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
-        else
-            printf '\nrootdev=UUID=%s\n' "${target_root_uuid}" >> "${arm_env}"
+        if [ "${target_root_type}" = "crypto_LUKS" ]; then
+            if grep -q '^rootdev=' "${arm_env}"; then
+                sed -i 's|^rootdev=.*$|rootdev=/dev/mapper/armbian-root|' "${arm_env}"
+            else
+                printf '\nrootdev=/dev/mapper/armbian-root\n' >> "${arm_env}"
+            fi
+            if [ -n "${target_root_uuid}" ]; then
+                if grep -q '^cryptdevice=' "${arm_env}"; then
+                    sed -i "s|^cryptdevice=.*$|cryptdevice=UUID=${target_root_uuid}:armbian-root|" "${arm_env}"
+                else
+                    printf 'cryptdevice=UUID=%s:armbian-root\n' "${target_root_uuid}" >> "${arm_env}"
+                fi
+            fi
+        elif [ -n "${target_root_uuid}" ]; then
+            if grep -q '^rootdev=' "${arm_env}"; then
+                sed -i "s|^rootdev=UUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+                sed -i "s|^rootdev=PARTUUID=.*$|rootdev=UUID=${target_root_uuid}|" "${arm_env}"
+            else
+                printf '\nrootdev=UUID=%s\n' "${target_root_uuid}" >> "${arm_env}"
+            fi
         fi
     fi
 
     sync
     umount "${root_mnt}" 2>/dev/null || log_warn "Failed to unmount target root partition"
+    if [ "${luks_opened}" -eq 1 ] && [ -n "${luks_mapper}" ]; then
+        cryptsetup luksClose "${luks_mapper}" >/dev/null 2>&1 || log_warn "Failed to close mapper ${luks_mapper}"
+    fi
     rm -rf "${root_mnt}"
 }
 

@@ -123,12 +123,18 @@ state_clear_runtime_fields() {
 read_package_manifest_value() {
     local package_path="$1"
     local key="$2"
+    local manifest_entry
 
-    if ! tar -tzf "${package_path}" ota_manifest.env >/dev/null 2>&1; then
+    manifest_entry="$(
+        tar -tzf "${package_path}" 2>/dev/null \
+            | awk '/(^|\/)ota_manifest\.env$/ { print; exit }'
+    )"
+    if [ -z "${manifest_entry}" ]; then
         return 1
     fi
 
-    tar -xOf "${package_path}" ota_manifest.env 2>/dev/null | grep -E "^${key}=" | tail -n1 | cut -d'=' -f2-
+    tar -xOf "${package_path}" "${manifest_entry}" 2>/dev/null \
+        | grep -E "^${key}=" | tail -n1 | cut -d'=' -f2-
 }
 
 assert_package_mode_matches() {
@@ -138,8 +144,18 @@ assert_package_mode_matches() {
 
     manifest_mode="$(read_package_manifest_value "${package_path}" "OTA_MODE" || true)"
     if [ -z "${manifest_mode}" ]; then
-        log_warn "ota_manifest.env missing OTA_MODE, skipping mode consistency check"
-        return 0
+        error_exit "OTA package metadata missing OTA_MODE; refusing to continue with --mode=${expected_mode}"
+    fi
+
+    case "${manifest_mode}" in
+        ab|recovery) ;;
+        *)
+            error_exit "Invalid OTA_MODE in package metadata: ${manifest_mode} (expected ab or recovery)"
+            ;;
+    esac
+
+    if [ "${expected_mode}" != "ab" ] && [ "${expected_mode}" != "recovery" ]; then
+        error_exit "Invalid requested OTA mode: ${expected_mode}"
     fi
 
     if [ "${manifest_mode}" != "${expected_mode}" ]; then

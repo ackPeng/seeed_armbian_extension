@@ -533,6 +533,35 @@ function enable_optee_bootchain_bl32_fit_node() {
     display_alert "secure-uboot" "OP-TEE bootchain: no commented gen_bl32_node marker found, leaving ${fit_generator} unchanged" "warn"
 }
 
+function rk_secure_boot_autodecrypt_mode_enabled() {
+    [[ "${CRYPTROOT_ENABLE}" == "yes" && "${RK_AUTO_DECRYP}" == "yes" ]]
+}
+
+function rk_secure_boot_verify_fit_images() {
+    local fit_image="$1"
+    local fit_info
+
+    [[ -f "${fit_image}" ]] || exit_with_error "FIT image missing after vendor build" "${fit_image}"
+
+    if ! command -v dumpimage >/dev/null 2>&1; then
+        display_alert "secure-uboot" "dumpimage not found, skip FIT image content verification" "warn"
+        return 0
+    fi
+
+    fit_info="$(dumpimage -l "${fit_image}" 2>/dev/null || true)"
+    [[ -n "${fit_info}" ]] || exit_with_error "Failed to parse FIT image" "${fit_image}"
+
+    # For auto-decryption mode, BL32(OP-TEE) and the third ATF loadable are mandatory.
+    if rk_secure_boot_autodecrypt_mode_enabled; then
+        grep -Eq 'Image [0-9]+ \(atf-3\)' <<< "${fit_info}" ||
+            exit_with_error "FIT image validation failed: missing atf-3 loadable" "${fit_image}"
+        grep -Eq 'Image [0-9]+ \(optee\)' <<< "${fit_info}" ||
+            exit_with_error "FIT image validation failed: missing optee loadable" "${fit_image}"
+    fi
+
+    display_alert "secure-uboot" "FIT image validation passed (${fit_image})" "info"
+}
+
 
 function build_custom_uboot__vendor_fit_secure() {
     # Use Rockchip vendor make.sh to build secure FIT version U-Boot.
@@ -646,6 +675,7 @@ function build_custom_uboot__vendor_fit_secure() {
     if [[ -f fit/u-boot.its ]]; then
         cp fit/u-boot.its u-boot.its
     fi
+    rk_secure_boot_verify_fit_images "u-boot.itb"
 
     # Create SPI loader image
     create_spi_loader_image

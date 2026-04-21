@@ -44,6 +44,82 @@ check_commands() {
     done
 }
 
+resolve_current_root_part() {
+    local root_src pkname
+    root_src="$(findmnt -n -o SOURCE /media/root-ro 2>/dev/null || true)"
+    [ -n "${root_src}" ] || root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+    [ -n "${root_src}" ] || return 1
+
+    case "${root_src}" in
+        /dev/mapper/*|/dev/dm-*)
+            pkname="$(lsblk -no PKNAME "${root_src}" 2>/dev/null | head -n1)"
+            [ -n "${pkname}" ] || return 1
+            echo "/dev/${pkname}"
+            ;;
+        *)
+            echo "${root_src}"
+            ;;
+    esac
+}
+
+cmdline_crypt_uuid() {
+    local token value
+    for token in $(cat /proc/cmdline 2>/dev/null); do
+        case "${token}" in
+            cryptdevice=UUID=*:*)
+                value="${token#cryptdevice=UUID=}"
+                echo "${value%%:*}"
+                return 0
+                ;;
+            cryptdevice=UUID=*)
+                value="${token#cryptdevice=UUID=}"
+                echo "${value}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+detect_current_slot() {
+    local root_part partlabel crypt_uuid crypt_dev ubootpart boot_a_puuid boot_b_puuid
+
+    root_part="$(resolve_current_root_part || true)"
+    if [ -n "${root_part}" ]; then
+        partlabel="$(blkid -s PARTLABEL -o value "${root_part}" 2>/dev/null || true)"
+        case "${partlabel}" in
+            rootfs_a) echo "a"; return 0 ;;
+            rootfs_b) echo "b"; return 0 ;;
+        esac
+    fi
+
+    crypt_uuid="$(cmdline_crypt_uuid || true)"
+    if [ -n "${crypt_uuid}" ]; then
+        crypt_dev="$(blkid -t UUID="${crypt_uuid}" -o device 2>/dev/null | head -n1)"
+        if [ -n "${crypt_dev}" ]; then
+            partlabel="$(blkid -s PARTLABEL -o value "${crypt_dev}" 2>/dev/null || true)"
+            case "${partlabel}" in
+                rootfs_a) echo "a"; return 0 ;;
+                rootfs_b) echo "b"; return 0 ;;
+            esac
+        fi
+    fi
+
+    ubootpart="$(sed -n 's/.*ubootpart=\([^ ]*\).*/\1/p' /proc/cmdline | head -n1)"
+    boot_a_puuid="$(blkid -t PARTLABEL=boot_a -o value -s PARTUUID 2>/dev/null | head -n1)"
+    boot_b_puuid="$(blkid -t PARTLABEL=boot_b -o value -s PARTUUID 2>/dev/null | head -n1)"
+    if [ -n "${ubootpart}" ] && [ -n "${boot_a_puuid}" ] && [ "${ubootpart}" = "${boot_a_puuid}" ]; then
+        echo "a"
+        return 0
+    fi
+    if [ -n "${ubootpart}" ] && [ -n "${boot_b_puuid}" ] && [ "${ubootpart}" = "${boot_b_puuid}" ]; then
+        echo "b"
+        return 0
+    fi
+
+    return 1
+}
+
 run_all_checks() {
     check_kernel
     check_root_fs
@@ -78,6 +154,19 @@ main() {
 
     state_mark_status "boot_verifying"
     log_info "Running A/B OTA health check"
+
+    local expected_slot current_slot
+    expected_slot="$(state_get TARGET_SLOT)"
+    current_slot="$(detect_current_slot || true)"
+
+    if [ -n "${expected_slot}" ] && [ -z "${current_slot}" ]; then
+        log_error "Cannot determine current slot while expecting target slot ${expected_slot}"
+        exit 1
+    fi
+    if [ -n "${expected_slot}" ] && [ -n "${current_slot}" ] && [ "${expected_slot}" != "${current_slot}" ]; then
+        log_error "Slot verification failed: expected target slot=${expected_slot}, current slot=${current_slot}"
+        exit 1
+    fi
 
     if run_all_checks; then
         log_info "A/B OTA health check passed"

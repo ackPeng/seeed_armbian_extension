@@ -358,10 +358,25 @@ function pre_prepare_partitions__secure_storage_partitions() {
 }
 
 function create_partition_table__secure_storage() {
+	# In AB mode, partition table is owned by create_partition_table__ab_part_ota.
+	# Keep this hook as a no-op to avoid overriding AB layout.
+	if [[ "${AB_PART_OTA}" == "yes" ]]; then
+		if [[ -n "${SECURE_STORAGE_SECURITY_PART_INDEX}" ]]; then
+			display_alert "secure-storage" "AB mode detected, reusing security partition index ${SECURE_STORAGE_SECURITY_PART_INDEX}" "info"
+		else
+			display_alert "secure-storage" "AB mode detected but security partition index is unset" "warn"
+		fi
+		return 0
+	fi
 
 	local next=${OFFSET} # Starting MiB
 	local p_index=1
 	local script="label: ${IMAGE_PARTITION_TABLE:-gpt}\n"
+	if [[ "${IMAGE_PARTITION_TABLE:-gpt}" == "gpt" ]]; then
+		# Reduce GPT table entry count to lower SPL allocation pressure during early GPT parsing.
+		local gpt_table_length="${SECURE_STORAGE_GPT_TABLE_LENGTH:-64}"
+		script+="table-length: ${gpt_table_length}\n"
+	fi
 
 	# BIOS (if exists)
 	if [[ -n "${BIOSSIZE}" && ${BIOSSIZE} -gt 0 ]]; then
@@ -467,8 +482,6 @@ function format_partitions__secure_storage() {
 				display_alert "secure-storage" "Password written and verified successfully" "info"
 			else
 				display_alert "secure-storage" "Password write verification failed" "warn"
-				display_alert "secure-storage" "Expected: ${CRYPTROOT_PASSPHRASE}" "debug"
-				display_alert "secure-storage" "Actual: ${read_back}" "debug"
 			fi
 
 			# Multiple syncs to ensure data is written to disk
